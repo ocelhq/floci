@@ -28,6 +28,7 @@ import io.github.hectorvent.floci.services.apigatewayv2.websocket.WebSocketConne
 import io.github.hectorvent.floci.services.elbv2.ElbV2Service;
 import io.github.hectorvent.floci.services.elbv2.model.Listener;
 import io.github.hectorvent.floci.services.elbv2.model.LoadBalancer;
+import io.github.hectorvent.floci.services.lambda.HttpIntegrationResponse;
 import io.github.hectorvent.floci.services.lambda.LambdaArnUtils;
 import io.github.hectorvent.floci.services.lambda.LambdaService;
 import io.github.hectorvent.floci.services.lambda.model.InvocationType;
@@ -491,10 +492,12 @@ public class ApiGatewayExecuteController {
                                  UriInfo uriInfo, byte[] body,
                                  AuthorizerResult authorizerResult, ResolvedApiKey resolvedApiKey,
                                  ExecuteApiSigV4Authorizer.CallerIdentity iamIdentity) {
-        String functionName = functionNameFromUri(integration.getUri());
+        String integrationUri = StageVariables.substitute(integration.getUri(),
+                stage != null ? stage.getVariables() : null);
+        String functionName = functionNameFromUri(integrationUri);
         if (functionName == null) {
             return gatewayResponse(scope, GatewayResponseType.API_CONFIGURATION_ERROR, 500,
-                    "Cannot resolve function from URI: " + integration.getUri());
+                    "Cannot resolve function from URI: " + integrationUri);
         }
 
         String requestId = UUID.randomUUID().toString();
@@ -1464,6 +1467,17 @@ public class ApiGatewayExecuteController {
     }
 
     Response buildProxyResponse(InvokeResult result, boolean httpApiV2) {
+        Optional<HttpIntegrationResponse> streamed = HttpIntegrationResponse.unpack(result);
+        if (streamed.isPresent()) {
+            Response.ResponseBuilder builder = Response.status(streamed.get().statusCode());
+            streamed.get().headers().forEach(builder::header);
+            streamed.get().cookies().forEach(cookie -> builder.header(HttpHeaders.SET_COOKIE, cookie));
+            builder.entity(streamed.get().body());
+            if (streamed.get().contentType() != null) {
+                builder.type(streamed.get().contentType());
+            }
+            return builder.build();
+        }
         if (result.getPayload() == null || result.getPayload().length == 0) {
             return Response.status(result.getFunctionError() != null ? 502 : result.getStatusCode()).build();
         }
@@ -1574,10 +1588,12 @@ public class ApiGatewayExecuteController {
                                           Integration integration, HttpHeaders headers,
                                           UriInfo uriInfo, byte[] body,
                                           AuthorizerResult authorizerResult) {
-        AwsServiceRouter.IntegrationTarget target = serviceRouter.parseIntegrationUri(integration.getUri());
+        String integrationUri = StageVariables.substitute(integration.getUri(),
+                scope.stage() != null ? scope.stage().getVariables() : null);
+        AwsServiceRouter.IntegrationTarget target = serviceRouter.parseIntegrationUri(integrationUri);
         if (target == null) {
             return gatewayResponse(scope, GatewayResponseType.API_CONFIGURATION_ERROR, 500,
-                    "Cannot parse AWS integration URI: " + integration.getUri());
+                    "Cannot parse AWS integration URI: " + integrationUri);
         }
 
         String requestId = UUID.randomUUID().toString();
@@ -1652,10 +1668,10 @@ public class ApiGatewayExecuteController {
         String errorMessage = null;
         try {
             if ("lambda".equals(target.service())) {
-                String functionName = functionNameFromUri(integration.getUri());
+                String functionName = functionNameFromUri(integrationUri);
                 if (functionName == null || functionName.isBlank()) {
                     throw new AwsException("InvalidParameterValueException",
-                            "Cannot resolve Lambda function name from URI: " + integration.getUri(), 400);
+                            "Cannot resolve Lambda function name from URI: " + integrationUri, 400);
                 }
                 byte[] payload = transformedBody != null ? transformedBody.getBytes(StandardCharsets.UTF_8) : new byte[0];
                 InvokeResult invokeResult = lambdaService.invoke(region, functionName, payload, InvocationType.RequestResponse);

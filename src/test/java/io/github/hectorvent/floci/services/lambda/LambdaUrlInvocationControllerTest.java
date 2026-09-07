@@ -269,6 +269,37 @@ class LambdaUrlInvocationControllerTest {
         assertNull(response.getEntity());
     }
 
+    @Test
+    void streamedResponseDeliversThePreludeStatusHeadersAndBody() {
+        LambdaFunction fn = new LambdaFunction();
+        fn.setFunctionName("my-function");
+        fn.setFunctionArn(FUNCTION_ARN);
+        fn.setAccountId("100000000012");
+
+        LambdaService lambdaService = mock(LambdaService.class);
+        when(lambdaService.getTargetByUrlId("url-id")).thenReturn(fn);
+        InvokeResult invokeResult = new InvokeResult();
+        invokeResult.setStatusCode(200);
+        invokeResult.setResponseMode(HttpIntegrationResponse.STREAMING_RESPONSE_MODE);
+        invokeResult.setResponseContentType(HttpIntegrationResponse.HTTP_INTEGRATION_CONTENT_TYPE);
+        invokeResult.setPayload(HttpIntegrationResponseTest.envelope(
+                "{\"statusCode\":200,\"headers\":{\"Content-Type\":\"application/json\","
+                        + "\"Content-Length\":\"10\"},\"cookies\":[]}",
+                "{\"id\":\"7\"}".getBytes(StandardCharsets.UTF_8)));
+        when(lambdaService.invokeArn(eq(FUNCTION_ARN), any(byte[].class), eq(InvocationType.RequestResponse)))
+                .thenReturn(invokeResult);
+
+        LambdaUrlInvocationController controller = newController(lambdaService);
+
+        Response response = controller.handleGet("url-id", "api/users/7", headersWith(null),
+                uriInfoFor("http://localhost/lambda-url/url-id/api/users/7"));
+
+        assertEquals(200, response.getStatus());
+        assertEquals("application/json", response.getMediaType().toString());
+        assertEquals("10", response.getHeaderString("Content-Length"));
+        assertEquals("{\"id\":\"7\"}", new String((byte[]) response.getEntity(), StandardCharsets.UTF_8));
+    }
+
     private JsonNode readTree(byte[] json) {
         try {
             return new ObjectMapper().readTree(json);
