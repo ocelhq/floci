@@ -86,8 +86,8 @@ public class LambdaUrlInvocationController {
     @DELETE
     @Path("/{proxy: .*}")
     public Response handleDelete(@PathParam("urlId") String urlId, @PathParam("proxy") String proxy,
-                                 @Context HttpHeaders headers, @Context UriInfo uriInfo) {
-        return invoke("DELETE", urlId, proxy, headers, uriInfo, null);
+                                 @Context HttpHeaders headers, @Context UriInfo uriInfo, byte[] body) {
+        return invoke("DELETE", urlId, proxy, headers, uriInfo, body);
     }
 
     @PATCH
@@ -169,13 +169,7 @@ public class LambdaUrlInvocationController {
         httpNode.put("sourceIp", "127.0.0.1");
         httpNode.put("userAgent", headers.getHeaderString("user-agent"));
 
-        if (body != null && body.length > 0) {
-            root.put("body", new String(body));
-            root.put("isBase64Encoded", false);
-        } else {
-            root.putNull("body");
-            root.put("isBase64Encoded", false);
-        }
+        ProxyRequestBody.put(root, body, headers.getHeaderString(HttpHeaders.CONTENT_TYPE));
 
         return root.toString();
     }
