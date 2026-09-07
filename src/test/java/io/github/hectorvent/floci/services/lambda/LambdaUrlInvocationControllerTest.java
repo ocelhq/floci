@@ -6,6 +6,7 @@ import io.github.hectorvent.floci.core.common.RequestContext;
 import io.github.hectorvent.floci.services.lambda.model.InvocationType;
 import io.github.hectorvent.floci.services.lambda.model.InvokeResult;
 import io.github.hectorvent.floci.services.lambda.model.LambdaAlias;
+import io.github.hectorvent.floci.services.lambda.model.LambdaFunction;
 import jakarta.ws.rs.core.HttpHeaders;
 import jakarta.ws.rs.core.MultivaluedHashMap;
 import jakarta.ws.rs.core.Response;
@@ -67,5 +68,44 @@ class LambdaUrlInvocationControllerTest {
         verify(lambdaService).invokeArn(eq(aliasArn), event.capture(), eq(InvocationType.RequestResponse));
         assertTrue(new String(event.getValue(), StandardCharsets.UTF_8)
                 .contains("\"accountId\":\"" + accountId + "\""));
+    }
+
+    @Test
+    void streamedResponseDeliversThePreludeStatusHeadersAndBody() {
+        String functionArn = "arn:aws:lambda:us-east-1:000000000000:function:web-r7";
+        LambdaFunction fn = new LambdaFunction();
+        fn.setFunctionName("web-r7");
+        fn.setFunctionArn(functionArn);
+
+        LambdaService lambdaService = mock(LambdaService.class);
+        when(lambdaService.getTargetByUrlId("url-id")).thenReturn(fn);
+        InvokeResult invokeResult = new InvokeResult();
+        invokeResult.setStatusCode(200);
+        invokeResult.setResponseMode(HttpIntegrationResponse.STREAMING_RESPONSE_MODE);
+        invokeResult.setResponseContentType(HttpIntegrationResponse.HTTP_INTEGRATION_CONTENT_TYPE);
+        invokeResult.setPayload(HttpIntegrationResponseTest.envelope(
+                "{\"statusCode\":200,\"headers\":{\"Content-Type\":\"application/json\","
+                        + "\"Content-Length\":\"10\"},\"cookies\":[]}",
+                "{\"id\":\"7\"}".getBytes(StandardCharsets.UTF_8)));
+        when(lambdaService.invokeArn(eq(functionArn), any(byte[].class), eq(InvocationType.RequestResponse)))
+                .thenReturn(invokeResult);
+
+        RegionResolver regionResolver = mock(RegionResolver.class);
+        when(regionResolver.getAccountId()).thenReturn("000000000000");
+        LambdaUrlInvocationController controller = new LambdaUrlInvocationController(
+                lambdaService, regionResolver, new ObjectMapper(), new RequestContext());
+
+        HttpHeaders headers = mock(HttpHeaders.class);
+        when(headers.getRequestHeaders()).thenReturn(new MultivaluedHashMap<>());
+        UriInfo uriInfo = mock(UriInfo.class);
+        when(uriInfo.getRequestUri()).thenReturn(URI.create("http://localhost/lambda-url/url-id/api/users/7"));
+        when(uriInfo.getQueryParameters()).thenReturn(new MultivaluedHashMap<>());
+
+        Response response = controller.handleGet("url-id", "api/users/7", headers, uriInfo);
+
+        assertEquals(200, response.getStatus());
+        assertEquals("application/json", response.getMediaType().toString());
+        assertEquals("10", response.getHeaderString("Content-Length"));
+        assertEquals("{\"id\":\"7\"}", new String((byte[]) response.getEntity(), StandardCharsets.UTF_8));
     }
 }

@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.lambda.runtime;
 
 import io.github.hectorvent.floci.services.lambda.model.ExtensionEvent;
+import io.github.hectorvent.floci.services.lambda.HttpIntegrationResponse;
 import io.github.hectorvent.floci.services.lambda.model.InvokeResult;
 import io.github.hectorvent.floci.services.lambda.model.PendingInvocation;
 import io.github.hectorvent.floci.services.lambda.model.RegisteredExtension;
@@ -379,6 +380,8 @@ public class RuntimeApiServer {
             if (invocation != null) {
                 byte[] payload = ctx.body().buffer() != null ? ctx.body().buffer().getBytes() : new byte[0];
                 InvokeResult result = new InvokeResult(200, null, payload, null, requestId);
+                result.setResponseMode(ctx.request().getHeader(HttpIntegrationResponse.RESPONSE_MODE_HEADER));
+                result.setResponseContentType(ctx.request().getHeader("Content-Type"));
                 invocation.getResultFuture().complete(result);
             }
             sendStatusOk(ctx);

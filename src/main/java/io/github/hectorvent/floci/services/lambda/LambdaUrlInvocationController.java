@@ -32,6 +32,7 @@ import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.util.Base64;
+import java.util.Optional;
 import java.util.UUID;
 
 /**
@@ -180,6 +181,10 @@ public class LambdaUrlInvocationController {
     }
 
     private Response buildResponse(InvokeResult result) {
+        Optional<HttpIntegrationResponse> streamed = HttpIntegrationResponse.unpack(result);
+        if (streamed.isPresent()) {
+            return streamedResponse(streamed.get());
+        }
         if (result.getPayload() == null || result.getPayload().length == 0) {
             return Response.status(result.getStatusCode()).build();
         }
@@ -204,6 +209,17 @@ public class LambdaUrlInvocationController {
         } catch (Exception e) {
             return Response.ok(result.getPayload()).build();
         }
+    }
+
+    private Response streamedResponse(HttpIntegrationResponse streamed) {
+        Response.ResponseBuilder builder = Response.status(streamed.statusCode());
+        streamed.headers().forEach(builder::header);
+        streamed.cookies().forEach(cookie -> builder.header(HttpHeaders.SET_COOKIE, cookie));
+        builder.entity(streamed.body());
+        if (streamed.contentType() != null) {
+            builder.type(streamed.contentType());
+        }
+        return builder.build();
     }
 
     private String jsonMessage(String message) {

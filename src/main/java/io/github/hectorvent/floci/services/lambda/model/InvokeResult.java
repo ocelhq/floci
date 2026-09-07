@@ -11,6 +11,8 @@ public class InvokeResult {
     private String logResult;
     private String requestId;
     private String executedVersion;
+    private String responseMode;
+    private String responseContentType;
 
     public InvokeResult() {
     }
@@ -69,5 +71,21 @@ public class InvokeResult {
 
     public void setExecutedVersion(String executedVersion) {
         this.executedVersion = executedVersion;
+    }
+
+    public String getResponseMode() {
+        return responseMode;
+    }
+
+    public void setResponseMode(String responseMode) {
+        this.responseMode = responseMode;
+    }
+
+    public String getResponseContentType() {
+        return responseContentType;
+    }
+
+    public void setResponseContentType(String responseContentType) {
+        this.responseContentType = responseContentType;
     }
 }

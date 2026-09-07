@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.apigatewayv2.websocket;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.services.apigateway.AwsServiceRouter;
+import io.github.hectorvent.floci.services.apigateway.StageVariables;
 import io.github.hectorvent.floci.services.apigateway.VtlTemplateEngine;
 import io.github.hectorvent.floci.services.apigatewayv2.model.Integration;
 import io.github.hectorvent.floci.services.lambda.LambdaArnUtils;
@@ -19,10 +20,7 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
-import java.util.Collections;
 import java.util.Map;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 
 /**
  * Resolves and invokes integration targets for WebSocket routes.
@@ -32,12 +30,6 @@ import java.util.regex.Pattern;
 public class WebSocketIntegrationInvoker {
 
     private static final Logger LOG = Logger.getLogger(WebSocketIntegrationInvoker.class);
-
-    /**
-     * Regex pattern matching ${stageVariables.variableName} references in URIs.
-     */
-    private static final Pattern STAGE_VAR_PATTERN =
-            Pattern.compile("\\$\\{stageVariables\\.([^}]+)}");
 
     private final LambdaService lambdaService;
     private final AwsServiceRouter serviceRouter;
@@ -509,24 +501,6 @@ public class WebSocketIntegrationInvoker {
      * @return the URI with all stage variable references substituted
      */
     String substituteStageVariables(String uri, Map<String, String> stageVariables) {
-        if (uri == null) {
-            return null;
-        }
-        if (stageVariables == null) {
-            stageVariables = Collections.emptyMap();
-        }
-
-        Matcher matcher = STAGE_VAR_PATTERN.matcher(uri);
-        StringBuilder result = new StringBuilder();
-        Map<String, String> vars = stageVariables;
-
-        while (matcher.find()) {
-            String variableName = matcher.group(1);
-            String replacement = vars.getOrDefault(variableName, "");
-            matcher.appendReplacement(result, Matcher.quoteReplacement(replacement));
-        }
-        matcher.appendTail(result);
-
-        return result.toString();
+        return StageVariables.substitute(uri, stageVariables);
     }
 }

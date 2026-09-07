@@ -6,6 +6,7 @@ import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.services.apigatewayv2.ApiGatewayV2Service;
 import io.github.hectorvent.floci.services.apigatewayv2.model.Api;
+import io.github.hectorvent.floci.services.lambda.HttpIntegrationResponse;
 import io.github.hectorvent.floci.services.lambda.model.InvokeResult;
 import jakarta.ws.rs.core.HttpHeaders;
 import jakarta.ws.rs.core.MultivaluedHashMap;
@@ -384,5 +385,27 @@ class ApiGatewayExecuteControllerTest {
                     response.getStringHeaders().get(HttpHeaders.SET_COOKIE));
             assertEquals("rest-v1", response.getHeaderString("X-Trace"));
         }
+    }
+
+    @Test
+    void buildProxyResponseDeliversAStreamedEnvelopeAsTheHttpResponse() {
+        ApiGatewayExecuteController controller = controller(new ObjectMapper());
+        byte[] body = "<html>hi</html>".getBytes(StandardCharsets.UTF_8);
+        java.io.ByteArrayOutputStream payload = new java.io.ByteArrayOutputStream();
+        payload.writeBytes(("{\"statusCode\":404,\"headers\":{\"content-type\":\"text/html\","
+                + "\"x-ocel-edge\":\"api-gateway\"},\"cookies\":[\"s=1\"]}").getBytes(StandardCharsets.UTF_8));
+        payload.writeBytes(new byte[8]);
+        payload.writeBytes(body);
+        InvokeResult result = new InvokeResult(200, null, payload.toByteArray(), null, "req-1");
+        result.setResponseMode(HttpIntegrationResponse.STREAMING_RESPONSE_MODE);
+        result.setResponseContentType(HttpIntegrationResponse.HTTP_INTEGRATION_CONTENT_TYPE);
+
+        Response response = controller.buildProxyResponse(result, false);
+
+        assertEquals(404, response.getStatus());
+        assertEquals("text/html", response.getMediaType().toString());
+        assertEquals("api-gateway", response.getHeaderString("x-ocel-edge"));
+        assertEquals("s=1", response.getHeaderString("Set-Cookie"));
+        assertEquals("<html>hi</html>", new String((byte[]) response.getEntity(), StandardCharsets.UTF_8));
     }
 }

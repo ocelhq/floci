@@ -23,6 +23,7 @@ import io.github.hectorvent.floci.services.apigatewayv2.websocket.WebSocketConne
 import io.github.hectorvent.floci.services.elbv2.ElbV2Service;
 import io.github.hectorvent.floci.services.elbv2.model.Listener;
 import io.github.hectorvent.floci.services.elbv2.model.LoadBalancer;
+import io.github.hectorvent.floci.services.lambda.HttpIntegrationResponse;
 import io.github.hectorvent.floci.services.lambda.LambdaArnUtils;
 import io.github.hectorvent.floci.services.lambda.LambdaService;
 import io.github.hectorvent.floci.services.lambda.model.InvocationType;
@@ -395,7 +396,7 @@ public class ApiGatewayExecuteController {
                     matched, stage, integration, headers, uriInfo, body, authorizerResult, resolvedApiKey,
                     iamIdentity);
             case "AWS" -> invokeAwsIntegration(region, httpMethod, path, proxy, stageName,
-                    matched, integration, headers, uriInfo, body);
+                    matched, stage, integration, headers, uriInfo, body);
             case "MOCK" -> invokeMock(region, httpMethod, path, stageName, matched, integration, headers, uriInfo, body);
             default -> Response.status(500)
                     .entity(jsonMessage("Unsupported integration type: " + integration.getType()))
@@ -417,10 +418,12 @@ public class ApiGatewayExecuteController {
                                  UriInfo uriInfo, byte[] body,
                                  AuthorizerResult authorizerResult, ResolvedApiKey resolvedApiKey,
                                  ExecuteApiSigV4Authorizer.CallerIdentity iamIdentity) {
-        String functionName = functionNameFromUri(integration.getUri());
+        String integrationUri = StageVariables.substitute(integration.getUri(),
+                stage != null ? stage.getVariables() : null);
+        String functionName = functionNameFromUri(integrationUri);
         if (functionName == null) {
             return Response.status(500)
-                    .entity(jsonMessage("Cannot resolve function from URI: " + integration.getUri()))
+                    .entity(jsonMessage("Cannot resolve function from URI: " + integrationUri))
                     .type(MediaType.APPLICATION_JSON).build();
         }
 
@@ -888,6 +891,17 @@ public class ApiGatewayExecuteController {
     }
 
     Response buildProxyResponse(InvokeResult result, boolean httpApiV2) {
+        Optional<HttpIntegrationResponse> streamed = HttpIntegrationResponse.unpack(result);
+        if (streamed.isPresent()) {
+            Response.ResponseBuilder builder = Response.status(streamed.get().statusCode());
+            streamed.get().headers().forEach(builder::header);
+            streamed.get().cookies().forEach(cookie -> builder.header(HttpHeaders.SET_COOKIE, cookie));
+            builder.entity(streamed.get().body());
+            if (streamed.get().contentType() != null) {
+                builder.type(streamed.get().contentType());
+            }
+            return builder.build();
+        }
         if (result.getPayload() == null || result.getPayload().length == 0) {
             return Response.status(result.getFunctionError() != null ? 502 : result.getStatusCode()).build();
         }
@@ -978,13 +992,15 @@ public class ApiGatewayExecuteController {
     }
 
     private Response invokeAwsIntegration(String region, String httpMethod, String path, String proxy,
-                                          String stageName, ApiGatewayResource resource,
+                                          String stageName, ApiGatewayResource resource, Stage stage,
                                           Integration integration, HttpHeaders headers,
                                           UriInfo uriInfo, byte[] body) {
-        AwsServiceRouter.IntegrationTarget target = serviceRouter.parseIntegrationUri(integration.getUri());
+        String integrationUri = StageVariables.substitute(integration.getUri(),
+                stage != null ? stage.getVariables() : null);
+        AwsServiceRouter.IntegrationTarget target = serviceRouter.parseIntegrationUri(integrationUri);
         if (target == null) {
             return Response.status(500)
-                    .entity(jsonMessage("Cannot parse AWS integration URI: " + integration.getUri()))
+                    .entity(jsonMessage("Cannot parse AWS integration URI: " + integrationUri))
                     .type(MediaType.APPLICATION_JSON).build();
         }
 
