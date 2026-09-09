@@ -2690,8 +2690,12 @@ public class LambdaService implements ResourceProvider {
                 }
             }
 
-            // For file-based runtimes, verify handler file exists (skip Java and .NET which use different handler formats)
-            if (fn.getRuntime() != null && !fn.getRuntime().startsWith("java") && !fn.getRuntime().startsWith("dotnet")) {
+            // For file-based runtimes, verify handler file exists (skip Java and .NET which use
+            // different handler formats, and provided.* whose bootstrap may live in a layer:
+            // https://docs.aws.amazon.com/lambda/latest/dg/runtimes-custom.html)
+            if (fn.getRuntime() != null && !fn.getRuntime().startsWith("java")
+                    && !fn.getRuntime().startsWith("dotnet")
+                    && !fn.getRuntime().startsWith("provided")) {
                 String handlerFile = resolveHandlerFilePath(fn);
                 boolean pythonRuntime = fn.getRuntime().startsWith("python");
                 boolean found;
