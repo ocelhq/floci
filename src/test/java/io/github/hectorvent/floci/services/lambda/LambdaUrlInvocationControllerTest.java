@@ -300,6 +300,32 @@ class LambdaUrlInvocationControllerTest {
         assertEquals("{\"id\":\"7\"}", new String((byte[]) response.getEntity(), StandardCharsets.UTF_8));
     }
 
+    @Test
+    void deleteRequestBodyReachesTheEvent() {
+        LambdaFunction fn = new LambdaFunction();
+        fn.setFunctionName("my-function");
+        fn.setFunctionArn(FUNCTION_ARN);
+        fn.setAccountId("100000000012");
+
+        LambdaService lambdaService = mock(LambdaService.class);
+        when(lambdaService.getTargetByUrlId("url-id")).thenReturn(fn);
+        InvokeResult invokeResult = new InvokeResult();
+        invokeResult.setStatusCode(200);
+        invokeResult.setPayload("{\"statusCode\":204}".getBytes(StandardCharsets.UTF_8));
+        when(lambdaService.invokeArn(eq(FUNCTION_ARN), any(byte[].class), eq(InvocationType.RequestResponse)))
+                .thenReturn(invokeResult);
+
+        LambdaUrlInvocationController controller = newController(lambdaService);
+
+        controller.handleDelete("url-id", "items", headersWith("application/json"),
+                uriInfoFor("http://localhost/lambda-url/url-id/items"),
+                "{\"ids\":[1,2]}".getBytes(StandardCharsets.UTF_8));
+
+        ArgumentCaptor<byte[]> event = ArgumentCaptor.forClass(byte[].class);
+        verify(lambdaService).invokeArn(eq(FUNCTION_ARN), event.capture(), eq(InvocationType.RequestResponse));
+        assertEquals("{\"ids\":[1,2]}", readTree(event.getValue()).get("body").asText());
+    }
+
     private JsonNode readTree(byte[] json) {
         try {
             return new ObjectMapper().readTree(json);
