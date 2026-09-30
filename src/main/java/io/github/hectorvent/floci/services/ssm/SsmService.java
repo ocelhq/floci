@@ -1,28 +1,38 @@
 package io.github.hectorvent.floci.services.ssm;
 
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.JsonNodeFactory;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.resource.ExplorerResource;
+import io.github.hectorvent.floci.core.resource.ResourceProvider;
+import io.github.hectorvent.floci.core.resource.SupportedResourceType;
 import io.github.hectorvent.floci.core.storage.InMemoryStorage;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
+import io.github.hectorvent.floci.services.ec2.Ec2ImageCatalog;
+import io.github.hectorvent.floci.services.secretsmanager.SecretsManagerService;
+import io.github.hectorvent.floci.services.secretsmanager.model.Secret;
+import io.github.hectorvent.floci.services.secretsmanager.model.SecretVersion;
 import io.github.hectorvent.floci.services.ssm.model.Parameter;
 import io.github.hectorvent.floci.services.ssm.model.ParameterHistory;
+import io.github.hectorvent.floci.services.ssm.model.ParameterStringFilter;
 import io.github.hectorvent.floci.services.ssm.model.PatchBaselineIdentity;
 import io.github.hectorvent.floci.services.ssm.model.ServiceSetting;
 import io.github.hectorvent.floci.services.ssm.model.SsmAssociation;
 import io.github.hectorvent.floci.services.ssm.model.SsmDocument;
-import com.fasterxml.jackson.core.type.TypeReference;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
 import java.time.Instant;
+import java.time.ZoneOffset;
+import java.time.format.DateTimeFormatter;
 import java.util.*;
-import io.github.hectorvent.floci.core.resource.ExplorerResource;
-import io.github.hectorvent.floci.core.resource.ResourceProvider;
-import io.github.hectorvent.floci.core.resource.SupportedResourceType;
-import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import java.util.ArrayList;
 import java.util.Set;
 
@@ -30,6 +40,15 @@ import java.util.Set;
 public class SsmService implements ResourceProvider {
 
     private static final Logger LOG = Logger.getLogger(SsmService.class);
+
+    private static final String PUBLIC_PARAMETER_PREFIX = "/aws/service/";
+    private static final DateTimeFormatter SOURCE_RESULT_DATE =
+            DateTimeFormatter.ofPattern("MMM d, yyyy, h:mm:ss a", Locale.US).withZone(ZoneOffset.UTC);
+    static final String SECRET_REFERENCE_PREFIX = "/aws/reference/secretsmanager/";
+    // Label is a ParameterStringFilter key too, but only GetParametersByPath accepts it.
+    private static final Set<String> DESCRIBE_PARAMETERS_FILTER_KEYS =
+            Set.of("Name", "Type", "KeyId", "Path", "Tier", "DataType");
+    private static final String DEFAULT_SSM_KEY_ID = "alias/aws/ssm";
 
     /**
      * Account-default values for the service settings floci models. AWS rejects
@@ -50,9 +69,12 @@ public class SsmService implements ResourceProvider {
     private final StorageBackend<String, SsmAssociation> associationStore;
     private final int maxParameterHistory;
     private final RegionResolver regionResolver;
+    private final Ec2ImageCatalog imageCatalog;
+    private final SecretsManagerService secretsManager;
 
     @Inject
-    public SsmService(StorageFactory storageFactory, EmulatorConfig config, RegionResolver regionResolver) {
+    public SsmService(StorageFactory storageFactory, EmulatorConfig config, RegionResolver regionResolver,
+                      Ec2ImageCatalog imageCatalog, SecretsManagerService secretsManager) {
         this(
                 storageFactory.create("ssm", "ssm-parameters.json",
                         new TypeReference<>() {
@@ -73,7 +95,9 @@ public class SsmService implements ResourceProvider {
                         new TypeReference<>() {
                         }),
                 config.services().ssm().maxParameterHistory(),
-                regionResolver
+                regionResolver,
+                imageCatalog,
+                secretsManager
         );
     }
 
@@ -86,7 +110,7 @@ public class SsmService implements ResourceProvider {
                int maxParameterHistory) {
         this(parameterStore, historyStore, documentPermissionStore, new InMemoryStorage<>(),
                 new InMemoryStorage<>(), new InMemoryStorage<>(), maxParameterHistory,
-                new RegionResolver("us-east-1", "000000000000"));
+                new RegionResolver("us-east-1", "000000000000")); // partition-literal: test-shaped constructor default
     }
 
     /**
@@ -97,7 +121,7 @@ public class SsmService implements ResourceProvider {
                int maxParameterHistory) {
         this(parameterStore, historyStore, new InMemoryStorage<>(), new InMemoryStorage<>(),
                 new InMemoryStorage<>(), new InMemoryStorage<>(), maxParameterHistory,
-                new RegionResolver("us-east-1", "000000000000"));
+                new RegionResolver("us-east-1", "000000000000")); // partition-literal: test-shaped constructor default
     }
 
     SsmService(StorageBackend<String, Parameter> parameterStore,
@@ -117,6 +141,22 @@ public class SsmService implements ResourceProvider {
                StorageBackend<String, ServiceSetting> serviceSettingStore,
                StorageBackend<String, SsmAssociation> associationStore,
                int maxParameterHistory, RegionResolver regionResolver) {
+        this(parameterStore, historyStore, documentPermissionStore, documentStore,
+                serviceSettingStore, associationStore, maxParameterHistory, regionResolver, null, null);
+    }
+
+    /**
+     * Package-private constructor for testing without CDI. A null image catalog means no
+     * public parameters are answered.
+     */
+    SsmService(StorageBackend<String, Parameter> parameterStore,
+               StorageBackend<String, List<ParameterHistory>> historyStore,
+               StorageBackend<String, List<String>> documentPermissionStore,
+               StorageBackend<String, SsmDocument> documentStore,
+               StorageBackend<String, ServiceSetting> serviceSettingStore,
+               StorageBackend<String, SsmAssociation> associationStore,
+               int maxParameterHistory, RegionResolver regionResolver,
+               Ec2ImageCatalog imageCatalog, SecretsManagerService secretsManager) {
         this.parameterStore = parameterStore;
         this.historyStore = historyStore;
         this.documentPermissionStore = documentPermissionStore;
@@ -125,6 +165,8 @@ public class SsmService implements ResourceProvider {
         this.associationStore = associationStore;
         this.maxParameterHistory = maxParameterHistory;
         this.regionResolver = regionResolver;
+        this.imageCatalog = imageCatalog;
+        this.secretsManager = secretsManager;
     }
 
     /**
@@ -132,12 +174,26 @@ public class SsmService implements ResourceProvider {
      * Returns the version number.
      */
     public long putParameter(String name, String value, String type, String description, boolean overwrite, String region) {
+        return putParameter(name, value, type, description, overwrite, null, region);
+    }
+
+    public long putParameter(String name, String value, String type, String description, boolean overwrite,
+                             Map<String, String> tags, String region) {
+        rejectReservedName(name);
         String storageKey = regionKey(region, name);
         Parameter existing = parameterStore.get(storageKey).orElse(null);
 
         if (existing != null && !overwrite) {
             throw new AwsException("ParameterAlreadyExists",
                     "The parameter already exists. To overwrite this value, set the overwrite option in the request to true.",
+                    400);
+        }
+
+        if (overwrite && tags != null && !tags.isEmpty()) {
+            throw new AwsException("ValidationException",
+                    "Invalid request: tags and overwrite can't be used together. To create a "
+                            + "parameter with tags, please remove overwrite flag. To update tags for an "
+                            + "existing parameter, please use AddTagsToResource or RemoveTagsFromResource.",
                     400);
         }
 
@@ -149,6 +205,12 @@ public class SsmService implements ResourceProvider {
         parameter.setArn(regionResolver.buildArn("ssm", region, "parameter" + name));
         parameter.setLastModifiedDate(Instant.now());
 
+        if (existing != null && existing.getTags() != null) {
+            parameter.setTags(new HashMap<>(existing.getTags()));
+        } else if (tags != null && !tags.isEmpty()) {
+            parameter.setTags(new HashMap<>(tags));
+        }
+
         parameterStore.put(storageKey, parameter);
         addHistory(storageKey, parameter);
 
@@ -156,39 +218,257 @@ public class SsmService implements ResourceProvider {
         return version;
     }
 
+    /** Reads on behalf of ECS task secrets, CodeBuild and CloudFormation ssm-secure, which decrypt. */
     public Parameter getParameter(String name, String region) {
-        String storageKey = regionKey(region, name);
-        return parameterStore.get(storageKey)
-                .orElseThrow(() -> new AwsException("ParameterNotFound",
-                        "Parameter " + name + " not found.", 400));
+        return getParameter(name, true, region);
     }
 
-    public List<Parameter> getParameters(List<String> names, String region) {
+    public Parameter getParameter(String name, boolean withDecryption, String region) {
+        if (name != null && name.startsWith(SECRET_REFERENCE_PREFIX)) {
+            return secretReference(name, withDecryption, region);
+        }
+        return findParameter(name, region).orElseThrow(() -> {
+            int separator = name == null ? -1 : name.lastIndexOf(':');
+            if (separator > 0 && separator < name.length() - 1
+                    && parameterStore.get(regionKey(region, name.substring(0, separator))).isPresent()) {
+                return new AwsException("ParameterVersionNotFound",
+                        "Systems Manager could not find version or label " + name.substring(separator + 1)
+                                + " of " + name.substring(0, separator) + ". Verify the version and try again.", 400);
+            }
+            return new AwsException("ParameterNotFound", "Parameter " + name + " not found.", 400);
+        });
+    }
+
+    /** A name AWS cannot answer, whatever the reason, is left out rather than failing the call. */
+    public List<Parameter> getParameters(List<String> names, boolean withDecryption, String region) {
         List<Parameter> result = new ArrayList<>();
         for (String name : names) {
-            parameterStore.get(regionKey(region, name)).ifPresent(result::add);
+            try {
+                result.add(getParameter(name, withDecryption, region));
+            } catch (AwsException e) {
+                LOG.debugv("GetParameters lists {0} as invalid: {1}", name, e.getMessage());
+            }
         }
         return result;
+    }
+
+    /**
+     * The resource IAM checks a reference read on: the secret's ARN, or for a secret that does not
+     * exist, the ARN a GetSecretValue by that name is checked on, so a missing secret is refused too.
+     * Null for a malformed name, which AWS rejects before it calls Secrets Manager.
+     */
+    String secretReferenceArn(String name, String region) {
+        SecretReferenceName reference = SecretReferenceName.of(name);
+        if (reference.malformed()) {
+            return null;
+        }
+        String secretId = reference.secretId();
+        try {
+            return secretsManager.describeSecret(secretId, region).getArn();
+        } catch (AwsException expected) {
+            // No such secret: check the name instead, so the caller is refused either way.
+            return regionResolver.buildArn("secretsmanager", region, "secret:" + secretId);
+        }
+    }
+
+    /**
+     * AWS answers {@code /aws/reference/secretsmanager/<secret-id>[:<version-id-or-label>]} with the
+     * secret's value. The order of the checks and the error texts are what AWS sends, including the
+     * missing slash and the "null" it prints for a name without a selector.
+     */
+    private Parameter secretReference(String name, boolean withDecryption, String region) {
+        SecretReferenceName reference = SecretReferenceName.of(name);
+        String secretId = reference.secretId();
+        String selector = reference.selector();
+        if (reference.malformed()) {
+            throw new AwsException("ValidationException", "Invalid parameter name. Please use correct syntax "
+                    + "for referencing a version/label  <name>:<version/label>", 400);
+        }
+        if (!withDecryption) {
+            throw new AwsException("ValidationException",
+                    "WithDecryption flag must be True for retrieving a Secret Manager secret.", 400);
+        }
+        Secret secret;
+        SecretVersion version;
+        try {
+            secret = secretsManager.describeSecret(secretId, region);
+            boolean byId = selector != null && secret.getVersions().containsKey(selector);
+            // By the ARN just described, so a secret replaced in between is not found rather than read.
+            // A miss still falls back to a secret named like the ARN's last part ("app-AbCdEf"), a
+            // name AWS warns against, so that fallback is deliberately not guarded here.
+            version = secretsManager.getSecretValue(secret.getArn(), byId ? selector : null,
+                    byId ? null : selector, region);
+        } catch (AwsException e) {
+            if ("ResourceNotFoundException".equals(e.getErrorCode())) {
+                throw new AwsException("ParameterNotFound", "An error occurred (ParameterNotFound) when referencing "
+                        + "Secrets Manager: Secret " + name.substring(1) + (selector == null ? "null" : "")
+                        + " not found.", 400);
+            }
+            throw new AwsException("ValidationException", "Invalid Request to Secrets Manager", 400);
+        }
+        Parameter parameter = new Parameter(SECRET_REFERENCE_PREFIX + secretId, version.getSecretString(), "SecureString");
+        parameter.setVersion(0);
+        parameter.setArn(secret.getArn());
+        parameter.setLastModifiedDate(version.getCreatedDate());
+        parameter.setDataType(null);
+        parameter.setSelector(selector == null ? null : ":" + selector);
+        parameter.setSourceResult(sourceResult(secret, version));
+        return parameter;
+    }
+
+    /** The secret id and the version id or staging label after the first colon, if any. */
+    private record SecretReferenceName(String secretId, String selector) {
+        static SecretReferenceName of(String name) {
+            String reference = name.substring(SECRET_REFERENCE_PREFIX.length());
+            int colon = reference.indexOf(':');
+            return colon < 0 ? new SecretReferenceName(reference, null)
+                    : new SecretReferenceName(reference.substring(0, colon), reference.substring(colon + 1));
+        }
+
+        /** A trailing colon or a second one, which AWS rejects before anything else. */
+        boolean malformed() {
+            return selector != null && (selector.isEmpty() || selector.contains(":"));
+        }
+    }
+
+    /**
+     * AWS's GetSecretValue result the way SSM serializes it: Gson's field names, order and default
+     * US date format in UTC, with null fields left out.
+     */
+    private static String sourceResult(Secret secret, SecretVersion version) {
+        ObjectNode result = JsonNodeFactory.instance.objectNode()
+                .put("ARN", secret.getArn())
+                .put("name", secret.getName())
+                .put("versionId", version.getVersionId());
+        if (version.getSecretString() != null) {
+            result.put("secretString", version.getSecretString());
+        }
+        // AWS dumps a binary secret's ByteBuffer internals here; left out until a caller reads them.
+        if (version.getVersionStages() != null) {
+            ArrayNode stages = result.putArray("versionStages");
+            version.getVersionStages().forEach(stages::add);
+        }
+        return result.put("createdDate", SOURCE_RESULT_DATE.format(version.getCreatedDate())).toString();
+    }
+
+    /**
+     * AWS reserves the {@code aws} and {@code ssm} namespaces, with or without a leading slash
+     * and regardless of case, so an account can never write over a public parameter. The rule
+     * keys on the first path segment rather than a bare prefix, so a name such as
+     * {@code ssm-auto-stack-Param-ABC}, which CloudFormation generates for a stack whose name
+     * starts with ssm, is still accepted.
+     */
+    private static void rejectReservedName(String name) {
+        String bare = name == null ? "" : name.startsWith("/") ? name.substring(1) : name;
+        String lower = bare.toLowerCase(Locale.ROOT);
+        if (lower.equals("aws") || lower.equals("ssm")
+                || lower.startsWith("aws/") || lower.startsWith("ssm/")) {
+            throw new AwsException("ValidationException",
+                    "Parameter name: can't be prefixed with \"aws\" or \"ssm\" (case-insensitive). "
+                            + "If formed as a path, it can consist of sub-paths divided by slash symbol; "
+                            + "each sub-path can be formed as a mix of letters, numbers and the following "
+                            + "3 symbols .-_", 400);
+        }
+    }
+
+    private Optional<Parameter> findParameter(String name, String region) {
+        Optional<Parameter> stored = parameterStore.get(regionKey(region, name));
+        if (stored.isPresent()) {
+            return stored;
+        }
+        Optional<Parameter> selected = findSelectedVersion(name, region);
+        if (selected.isPresent()) {
+            return selected;
+        }
+        return publicParameter(name, region);
+    }
+
+    /**
+     * A read may name a version or label as {@code name:version} or {@code name:label}. A
+     * parameter name cannot contain a colon, so the last one always starts the selector. The
+     * answer is a copy built from the history entry: it carries the base name and the selector
+     * as AWS returns them, and nothing is written back.
+     */
+    private Optional<Parameter> findSelectedVersion(String name, String region) {
+        int separator = name == null ? -1 : name.lastIndexOf(':');
+        if (separator <= 0 || separator == name.length() - 1) {
+            return Optional.empty();
+        }
+        String baseName = name.substring(0, separator);
+        String selector = name.substring(separator + 1);
+        String storageKey = regionKey(region, baseName);
+        Optional<Parameter> current = parameterStore.get(storageKey);
+        if (current.isEmpty()) {
+            return Optional.empty();
+        }
+        boolean isVersion = selector.chars().allMatch(Character::isDigit);
+        // A label is unique across parameter versions because attaching it moves it from any prior version.
+        return historyStore.get(storageKey).orElse(List.of()).stream()
+                .filter(h -> isVersion
+                        ? String.valueOf(h.getVersion()).equals(selector)
+                        : h.getLabels() != null && h.getLabels().contains(selector))
+                .max(Comparator.comparingLong(ParameterHistory::getVersion))
+                .map(h -> {
+                    Parameter parameter = new Parameter(baseName, h.getValue(), h.getType());
+                    parameter.setVersion(h.getVersion());
+                    parameter.setDescription(h.getDescription());
+                    parameter.setLastModifiedDate(h.getLastModifiedDate());
+                    parameter.setArn(current.get().getArn());
+                    parameter.setDataType(current.get().getDataType());
+                    parameter.setSelector(":" + selector);
+                    return parameter;
+                });
+    }
+
+    /**
+     * AWS publishes read-only AMI id parameters under {@code /aws/service/} in every account
+     * with no setup, so a read of one of those names is answered from the EC2 image catalog.
+     * Nothing is written: like on AWS the parameter is not the account's own, so it never
+     * shows up in DescribeParameters or GetParameterHistory. Any other name under the prefix
+     * is still ParameterNotFound.
+     */
+    private Optional<Parameter> publicParameter(String name, String region) {
+        if (imageCatalog == null || name == null || !name.startsWith(PUBLIC_PARAMETER_PREFIX)) {
+            return Optional.empty();
+        }
+        return imageCatalog.findByPublicParameterName(name).map(image -> {
+            Parameter parameter = new Parameter(name, image.imageId, "String");
+            parameter.setArn(AwsArnUtils.Arn.of("ssm", region, "", "parameter" + name).toString());
+            parameter.setLastModifiedDate(Instant.parse(image.creationDate));
+            return parameter;
+        });
     }
 
     public List<Parameter> getParametersByPath(String path, boolean recursive, String region) {
         String normalizedPath = path.endsWith("/") ? path : path + "/";
         String prefix = region + "::";
 
-        return parameterStore.scan(key -> {
+        List<Parameter> result = new ArrayList<>(parameterStore.scan(key -> {
             if (!key.startsWith(prefix)) {
                 return false;
             }
-            String paramName = key.substring(prefix.length());
-            if (!paramName.startsWith(normalizedPath)) {
-                return false;
+            return underPath(key.substring(prefix.length()), normalizedPath, recursive);
+        }));
+        if (imageCatalog != null) {
+            // The public names answer to the same path and Recursive rules as stored ones, so a
+            // recursive query on an ancestor such as /aws lists them too.
+            for (String name : imageCatalog.publicParameterNames()) {
+                if (underPath(name, normalizedPath, recursive)) {
+                    publicParameter(name, region).ifPresent(result::add);
+                }
             }
-            if (recursive) {
-                return true;
-            }
-            String remainder = paramName.substring(normalizedPath.length());
-            return !remainder.contains("/");
-        });
+        }
+        return result;
+    }
+
+    private static boolean underPath(String paramName, String normalizedPath, boolean recursive) {
+        if (!paramName.startsWith(normalizedPath)) {
+            return false;
+        }
+        if (recursive) {
+            return true;
+        }
+        return !paramName.substring(normalizedPath.length()).contains("/");
     }
 
     public void deleteParameter(String name, String region) {
@@ -228,53 +508,213 @@ public class SsmService implements ResourceProvider {
         return describeParameters(List.of(), region);
     }
 
-    public List<Parameter> describeParameters(List<String> nameFilters, String region) {
+    /**
+     * Lists the region's own parameters that pass every filter: filters combine with AND, the
+     * values of one filter with OR. A key or option AWS rejects is an error rather than being
+     * skipped, because dropping a filter silently widens the result.
+     */
+    public List<Parameter> describeParameters(List<ParameterStringFilter> filters, String region) {
+        filters.forEach(SsmService::validateDescribeParametersFilter);
         String prefix = region + "::";
-        return parameterStore.scan(key -> {
-            if (!key.startsWith(prefix)) return false;
-            if (nameFilters.isEmpty()) return true;
-            String name = key.substring(prefix.length());
-            return nameFilters.contains(name);
+        return parameterStore.scan(key -> key.startsWith(prefix)).stream()
+                .filter(p -> filters.stream().allMatch(f -> matchesParameterFilter(p, f)))
+                .toList();
+    }
+
+    private static void validateDescribeParametersFilter(ParameterStringFilter filter) {
+        String key = filter.key();
+        boolean tag = key != null && key.startsWith("tag:") && key.length() > "tag:".length();
+        // Set.of rejects a null lookup, so an absent key is checked before the membership test.
+        if (!tag && (key == null || !DESCRIBE_PARAMETERS_FILTER_KEYS.contains(key))) {
+            throw new AwsException("InvalidFilterKey", "The specified key isn't valid.", 400);
+        }
+        if (filter.option() != null) {
+            Set<String> options = "Path".equals(key) ? Set.of("Recursive", "OneLevel")
+                    : "Name".equals(key) ? Set.of("Equals", "BeginsWith", "Contains")
+                    : Set.of("Equals", "BeginsWith");
+            if (!options.contains(filter.option())) {
+                throw new AwsException("InvalidFilterOption",
+                        "The specified filter option isn't valid. Valid options are Equals and BeginsWith. "
+                                + "For Path filter, valid options are Recursive and OneLevel.", 400);
+            }
+        }
+        // Every key but a tag needs at least one value, and a path value must be absolute.
+        boolean invalidValues = !tag && filter.values().isEmpty()
+                || "Path".equals(key) && filter.values().stream().anyMatch(v -> !v.startsWith("/"));
+        if (invalidValues) {
+            throw new AwsException("InvalidFilterValue",
+                    "The filter value isn't valid. Verify the value and try again.", 400);
+        }
+    }
+
+    private static boolean matchesParameterFilter(Parameter parameter, ParameterStringFilter filter) {
+        String key = filter.key();
+        if (key.startsWith("tag:")) {
+            String tagValue = parameter.getTags() == null ? null
+                    : parameter.getTags().get(key.substring("tag:".length()));
+            // A tag filter without values matches any parameter carrying the tag key.
+            return tagValue != null && (filter.values().isEmpty() || matchesAny(tagValue, filter));
+        }
+        if ("Path".equals(key)) {
+            boolean recursive = "Recursive".equals(filter.option());
+            return filter.values().stream().anyMatch(path ->
+                    underPath(parameter.getName(), path.endsWith("/") ? path : path + "/", recursive));
+        }
+        String actual = switch (key) {
+            case "Name" -> parameter.getName();
+            case "Type" -> parameter.getType();
+            case "DataType" -> parameter.getDataType();
+            // Floci stores neither a tier nor a customer key, so every parameter is Standard and
+            // a SecureString is encrypted with the AWS managed key, as AWS defaults them.
+            case "Tier" -> "Standard";
+            case "KeyId" -> "SecureString".equals(parameter.getType()) ? DEFAULT_SSM_KEY_ID : null;
+            default -> null;
+        };
+        return actual != null && matchesAny(actual, filter);
+    }
+
+    private static boolean matchesAny(String actual, ParameterStringFilter filter) {
+        String option = filter.option() == null ? "Equals" : filter.option();
+        return filter.values().stream().anyMatch(value -> switch (option) {
+            case "BeginsWith" -> actual.startsWith(value);
+            case "Contains" -> actual.contains(value);
+            default -> actual.equals(value);
         });
     }
 
-    public void labelParameterVersion(String name, long parameterVersion, List<String> labels, String region) {
-        String storageKey = regionKey(region, name);
-        if (parameterStore.get(storageKey).isEmpty()) {
-            throw new AwsException("ParameterNotFound",
-                    "Parameter " + name + " not found.", 400);
+    public record LabelParameterVersionResult(long parameterVersion, List<String> invalidLabels) {}
+
+    public synchronized LabelParameterVersionResult labelParameterVersion(String name, Long parameterVersion,
+                                                             List<String> labels, String region) {
+        if (labels == null || labels.isEmpty()) {
+            throw new AwsException("ValidationException",
+                    "1 validation error detected: Value at 'labels' failed to satisfy constraint: Member must have length greater than or equal to 1",
+                    400);
         }
-
-        List<ParameterHistory> history = historyStore.get(storageKey)
-                .orElse(List.of());
-
-        history = new ArrayList<>(history);
-
-        boolean found = false;
-        for (ParameterHistory h : history) {
-            if (h.getVersion() == parameterVersion) {
-                List<String> existing = h.getLabels() != null ? new ArrayList<>(h.getLabels()) : new ArrayList<>();
-                for (String label : labels) {
-                    if (!existing.contains(label)) {
-                        existing.add(label);
-                    }
-                }
-                h.setLabels(existing);
-                found = true;
-                break;
+        if (labels.size() > 10) {
+            throw new AwsException("ValidationException",
+                    "1 validation error detected: Value at 'labels' failed to satisfy constraint: Member must have length less than or equal to 10",
+                    400);
+        }
+        for (String label : labels) {
+            if (label == null || label.isEmpty()) {
+                throw new AwsException("ValidationException",
+                        "1 validation error detected: Value at 'labels' failed to satisfy constraint: Member must have length greater than or equal to 1",
+                        400);
+            }
+            if (label.length() > 100) {
+                throw new AwsException("ValidationException",
+                        "1 validation error detected: Value at 'labels' failed to satisfy constraint: Member must have length less than or equal to 100",
+                        400);
             }
         }
 
-        if (!found) {
-            throw new AwsException("ParameterVersionNotFound", "Parameter version " + parameterVersion + " not found.", 400);
+        String storageKey = regionKey(region, name);
+        Parameter current = parameterStore.get(storageKey).orElseThrow(() ->
+                new AwsException("ParameterNotFound", "Parameter " + name + " not found.", 400));
+
+        long targetVersion = parameterVersion == null
+                ? current.getVersion()
+                : parameterVersion;
+
+        List<ParameterHistory> existingHistory = historyStore.get(storageKey).orElse(List.of());
+        List<ParameterHistory> updatedHistory = new ArrayList<>(existingHistory.size());
+
+        ParameterHistory targetCopy = null;
+        for (ParameterHistory h : existingHistory) {
+            ParameterHistory copy = new ParameterHistory(h);
+            if (copy.getVersion() == targetVersion) {
+                targetCopy = copy;
+            }
+            updatedHistory.add(copy);
         }
 
-        historyStore.put(storageKey, history);
-        LOG.infov("Labeled parameter {0} version {1} with labels {2}", name, parameterVersion, labels);
+        if (targetCopy == null) {
+            throw new AwsException("ParameterVersionNotFound",
+                    "Parameter version " + targetVersion + " not found.", 400);
+        }
+
+        List<String> invalidLabels = new ArrayList<>();
+        List<String> validLabels = new ArrayList<>();
+        if (labels != null) {
+            for (String label : labels) {
+                if (isValidLabel(label)) {
+                    if (!validLabels.contains(label)) {
+                        validLabels.add(label);
+                    }
+                } else {
+                    if (!invalidLabels.contains(label)) {
+                        invalidLabels.add(label);
+                    }
+                }
+            }
+        }
+
+        List<String> targetLabels = targetCopy.getLabels() != null
+                ? new ArrayList<>(targetCopy.getLabels())
+                : new ArrayList<>();
+
+        int newLabelCount = targetLabels.size();
+        for (String validLabel : validLabels) {
+            if (!targetLabels.contains(validLabel)) {
+                newLabelCount++;
+            }
+        }
+        if (newLabelCount > 10) {
+            throw new AwsException("ParameterVersionLabelLimitExceeded",
+                    "The parameter version already has the maximum number of labels (10).", 400);
+        }
+
+        for (ParameterHistory h : updatedHistory) {
+            if (h.getVersion() != targetVersion && h.getLabels() != null) {
+                List<String> otherLabels = new ArrayList<>(h.getLabels());
+                if (otherLabels.removeAll(validLabels)) {
+                    h.setLabels(otherLabels);
+                }
+            }
+        }
+
+        for (String validLabel : validLabels) {
+            if (!targetLabels.contains(validLabel)) {
+                targetLabels.add(validLabel);
+            }
+        }
+        targetCopy.setLabels(targetLabels);
+
+        historyStore.put(storageKey, updatedHistory);
+        LOG.infov("Labeled parameter {0} version {1} with labels {2}", name, targetVersion, validLabels);
+        return new LabelParameterVersionResult(targetVersion, invalidLabels);
+    }
+
+    public synchronized LabelParameterVersionResult labelParameterVersion(String name, long parameterVersion,
+                                                             List<String> labels, String region) {
+        return labelParameterVersion(name, Long.valueOf(parameterVersion), labels, region);
+    }
+
+    private static boolean isValidLabel(String label) {
+        if (label == null || label.isEmpty() || label.length() > 100) {
+            return false;
+        }
+        if (Character.isDigit(label.charAt(0))) {
+            return false;
+        }
+        String lower = label.toLowerCase(Locale.ROOT);
+        if (lower.startsWith("aws") || lower.startsWith("ssm")) {
+            return false;
+        }
+        for (int i = 0; i < label.length(); i++) {
+            char c = label.charAt(i);
+            if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+                    || c == '.' || c == '-' || c == '_')) {
+                return false;
+            }
+        }
+        return true;
     }
 
     public void addTagsToResource(String resourceId, Map<String, String> tags, String region) {
-        String storageKey = regionKey(region, resourceId);
+        String normalizedId = normalizeResourceId(resourceId);
+        String storageKey = regionKey(region, normalizedId);
         Parameter param = parameterStore.get(storageKey)
                 .orElseThrow(() -> new AwsException("InvalidResourceId",
                         "Resource " + resourceId + " not found.", 400));
@@ -288,7 +728,8 @@ public class SsmService implements ResourceProvider {
     }
 
     public Map<String, String> listTagsForResource(String resourceId, String region) {
-        String storageKey = regionKey(region, resourceId);
+        String normalizedId = normalizeResourceId(resourceId);
+        String storageKey = regionKey(region, normalizedId);
         Parameter param = parameterStore.get(storageKey)
                 .orElseThrow(() -> new AwsException("InvalidResourceId",
                         "Resource " + resourceId + " not found.", 400));
@@ -296,7 +737,8 @@ public class SsmService implements ResourceProvider {
     }
 
     public void removeTagsFromResource(String resourceId, List<String> tagKeys, String region) {
-        String storageKey = regionKey(region, resourceId);
+        String normalizedId = normalizeResourceId(resourceId);
+        String storageKey = regionKey(region, normalizedId);
         Parameter param = parameterStore.get(storageKey)
                 .orElseThrow(() -> new AwsException("InvalidResourceId",
                         "Resource " + resourceId + " not found.", 400));
@@ -308,6 +750,28 @@ public class SsmService implements ResourceProvider {
             parameterStore.put(storageKey, param);
         }
         LOG.debugv("Removed tags from parameter: {0}", resourceId);
+    }
+
+    private static String normalizeResourceId(String resourceId) {
+        if (resourceId != null && resourceId.startsWith("arn:")) {
+            try {
+                AwsArnUtils.Arn arn = AwsArnUtils.parse(resourceId);
+                if ("ssm".equals(arn.service())) {
+                    String resource = arn.resource();
+                    if (resource.startsWith("parameter/")) {
+                        return resource.substring("parameter".length());
+                    }
+                    if (resource.startsWith("parameter")) {
+                        return resource.substring("parameter".length());
+                    }
+                }
+            } catch (IllegalArgumentException e) {
+                // Not a valid ARN; fall through and use resourceId directly so callers
+                // querying parameterStore produce the standard InvalidResourceId error.
+                LOG.debugv("Failed to parse resourceId as ARN: {0}", resourceId);
+            }
+        }
+        return resourceId;
     }
 
     // ──────────────────────── Documents and Share Permissions ────────────────
@@ -744,7 +1208,7 @@ public class SsmService implements ResourceProvider {
         requireKnownSetting(settingId);
         ServiceSetting setting = new ServiceSetting(settingId, settingValue,
                 settingArn(settingId, region), "Customized",
-                "arn:aws:iam::" + regionResolver.getAccountId() + ":root");
+                regionResolver.buildGlobalArn("iam", "root"));
         serviceSettingStore.put(settingKey(region, settingId), setting);
     }
 
@@ -778,8 +1242,7 @@ public class SsmService implements ResourceProvider {
 
     private String settingArn(String settingId, String region) {
         // Setting ids begin with "/", so concatenation yields .../servicesetting/ssm/...
-        return "arn:aws:ssm:" + region + ":" + regionResolver.getAccountId()
-                + ":servicesetting" + settingId;
+        return AwsArnUtils.Arn.of("ssm", region, regionResolver.getAccountId(), "servicesetting" + settingId).toString();
     }
 
     private static String regionKey(String region, String name) {

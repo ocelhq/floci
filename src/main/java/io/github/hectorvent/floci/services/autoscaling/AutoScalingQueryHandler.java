@@ -117,7 +117,9 @@ public class AutoScalingQueryHandler {
                 memberList(p, "SecurityGroups"),
                 p.getFirst("UserData"),
                 p.getFirst("IamInstanceProfile"),
-                nullableBoolParam(p, "AssociatePublicIpAddress"));
+                nullableBoolParam(p, "AssociatePublicIpAddress"),
+                nullableBoolParam(p, "InstanceMonitoring.Enabled"),
+                parseLaunchConfigurationBlockDeviceMappings(p));
         String xml = new XmlBuilder()
                 .start("CreateLaunchConfigurationResponse", NS)
                   .raw(AwsQueryResponse.responseMetadata())
@@ -150,7 +152,15 @@ public class AutoScalingQueryHandler {
             if (lc.getIamInstanceProfile() != null) { xml.elem("IamInstanceProfile", lc.getIamInstanceProfile()); }
             xml.start("SecurityGroups");
             for (String sg : lc.getSecurityGroups()) { xml.elem("member", sg); }
-            xml.end("SecurityGroups").end("member");
+            xml.end("SecurityGroups");
+            // AWS always returns both structures. A record from before these fields were
+            // stored reads back AWS's default of enabled and an empty mapping list.
+            xml.start("InstanceMonitoring")
+               .elem("Enabled", String.valueOf(
+                       lc.getInstanceMonitoringEnabled() != null ? lc.getInstanceMonitoringEnabled() : Boolean.TRUE))
+               .end("InstanceMonitoring");
+            writeLaunchConfigurationBlockDeviceMappings(xml, lc.getBlockDeviceMappings());
+            xml.end("member");
         }
         xml.end("LaunchConfigurations")
            .end("DescribeLaunchConfigurationsResult")
@@ -190,7 +200,8 @@ public class AutoScalingQueryHandler {
                 intParam(p, "HealthCheckGracePeriod", 0),
                 memberList(p, "TerminationPolicies"),
                 parsedTags.tags(),
-                parsedTags.propagateAtLaunch());
+                parsedTags.propagateAtLaunch(),
+                parseAsgOptionalFields(p));
         return ok(new XmlBuilder()
                 .start("CreateAutoScalingGroupResponse", NS)
                   .raw(AwsQueryResponse.responseMetadata())
@@ -216,7 +227,8 @@ public class AutoScalingQueryHandler {
                 subnetIds.isEmpty() ? null : subnetIds,
                 p.getFirst("HealthCheckType"),
                 p.getFirst("HealthCheckGracePeriod") != null ? Integer.parseInt(p.getFirst("HealthCheckGracePeriod")) : null,
-                tps.isEmpty() ? null : tps);
+                tps.isEmpty() ? null : tps,
+                parseAsgOptionalFields(p));
         return ok(new XmlBuilder()
                 .start("UpdateAutoScalingGroupResponse", NS)
                   .raw(AwsQueryResponse.responseMetadata())
@@ -263,6 +275,18 @@ public class AutoScalingQueryHandler {
            .elem("HealthCheckGracePeriod", String.valueOf(asg.getHealthCheckGracePeriod()))
            .elem("CreatedTime", ISO_FMT.format(asg.getCreatedTime()));
 
+        if (asg.getDesiredCapacityType() != null) {
+            xml.elem("DesiredCapacityType", asg.getDesiredCapacityType());
+        }
+        if (asg.getCapacityRebalance() != null) {
+            xml.elem("CapacityRebalance", String.valueOf(asg.getCapacityRebalance()));
+        }
+        if (asg.getMaxInstanceLifetime() != null) {
+            xml.elem("MaxInstanceLifetime", String.valueOf(asg.getMaxInstanceLifetime()));
+        }
+        if (asg.getDefaultInstanceWarmup() != null) {
+            xml.elem("DefaultInstanceWarmup", String.valueOf(asg.getDefaultInstanceWarmup()));
+        }
         if (asg.getLaunchConfigurationName() != null) {
             xml.elem("LaunchConfigurationName", asg.getLaunchConfigurationName());
         }
@@ -557,6 +581,7 @@ public class AutoScalingQueryHandler {
                     if (override.getInstanceType() != null) {
                         xml.elem("InstanceType", override.getInstanceType());
                     }
+                    appendInstanceRequirementsXml(xml, override.getInstanceRequirements());
                     xml.end("member");
                 }
                 xml.end("Overrides");
@@ -579,6 +604,89 @@ public class AutoScalingQueryHandler {
             xml.end("InstancesDistribution");
         }
         xml.end("MixedInstancesPolicy");
+    }
+
+    // LaunchTemplateOverrides.InstanceRequirements from botocore's autoscaling model. Every member
+    // of that shape is echoed back except BaselinePerformanceFactors, whose nested Reference/item
+    // wire names are not covered here.
+    private static void appendInstanceRequirementsXml(
+            XmlBuilder xml, MixedInstancesPolicy.InstanceRequirements requirements) {
+        if (requirements == null || requirements.isEmpty()) {
+            return;
+        }
+        xml.start("InstanceRequirements");
+        appendIntRangeXml(xml, "VCpuCount", requirements.getVCpuCount());
+        appendIntRangeXml(xml, "MemoryMiB", requirements.getMemoryMiB());
+        appendIntRangeXml(xml, "NetworkInterfaceCount", requirements.getNetworkInterfaceCount());
+        appendIntRangeXml(xml, "AcceleratorCount", requirements.getAcceleratorCount());
+        appendIntRangeXml(xml, "AcceleratorTotalMemoryMiB", requirements.getAcceleratorTotalMemoryMiB());
+        appendIntRangeXml(xml, "BaselineEbsBandwidthMbps", requirements.getBaselineEbsBandwidthMbps());
+        appendDoubleRangeXml(xml, "MemoryGiBPerVCpu", requirements.getMemoryGiBPerVCpu());
+        appendDoubleRangeXml(xml, "TotalLocalStorageGB", requirements.getTotalLocalStorageGB());
+        appendDoubleRangeXml(xml, "NetworkBandwidthGbps", requirements.getNetworkBandwidthGbps());
+        appendStringMemberListXml(xml, "CpuManufacturers", requirements.getCpuManufacturers());
+        appendStringMemberListXml(xml, "ExcludedInstanceTypes", requirements.getExcludedInstanceTypes());
+        appendStringMemberListXml(xml, "InstanceGenerations", requirements.getInstanceGenerations());
+        appendStringMemberListXml(xml, "LocalStorageTypes", requirements.getLocalStorageTypes());
+        appendStringMemberListXml(xml, "AcceleratorTypes", requirements.getAcceleratorTypes());
+        appendStringMemberListXml(xml, "AcceleratorManufacturers", requirements.getAcceleratorManufacturers());
+        appendStringMemberListXml(xml, "AcceleratorNames", requirements.getAcceleratorNames());
+        appendStringMemberListXml(xml, "AllowedInstanceTypes", requirements.getAllowedInstanceTypes());
+        if (requirements.getSpotMaxPricePercentageOverLowestPrice() != null) {
+            xml.elem("SpotMaxPricePercentageOverLowestPrice", String.valueOf(requirements.getSpotMaxPricePercentageOverLowestPrice()));
+        }
+        if (requirements.getMaxSpotPriceAsPercentageOfOptimalOnDemandPrice() != null) {
+            xml.elem("MaxSpotPriceAsPercentageOfOptimalOnDemandPrice", String.valueOf(requirements.getMaxSpotPriceAsPercentageOfOptimalOnDemandPrice()));
+        }
+        if (requirements.getOnDemandMaxPricePercentageOverLowestPrice() != null) {
+            xml.elem("OnDemandMaxPricePercentageOverLowestPrice", String.valueOf(requirements.getOnDemandMaxPricePercentageOverLowestPrice()));
+        }
+        if (requirements.getRequireHibernateSupport() != null) {
+            xml.elem("RequireHibernateSupport", String.valueOf(requirements.getRequireHibernateSupport()));
+        }
+        xml.elem("BareMetal", requirements.getBareMetal());
+        xml.elem("BurstablePerformance", requirements.getBurstablePerformance());
+        xml.elem("LocalStorage", requirements.getLocalStorage());
+        xml.end("InstanceRequirements");
+    }
+
+    private static void appendIntRangeXml(XmlBuilder xml, String element, MixedInstancesPolicy.IntRange range) {
+        if (range == null) {
+            return;
+        }
+        xml.start(element);
+        if (range.getMin() != null) {
+            xml.elem("Min", String.valueOf(range.getMin()));
+        }
+        if (range.getMax() != null) {
+            xml.elem("Max", String.valueOf(range.getMax()));
+        }
+        xml.end(element);
+    }
+
+    private static void appendDoubleRangeXml(XmlBuilder xml, String element, MixedInstancesPolicy.DoubleRange range) {
+        if (range == null) {
+            return;
+        }
+        xml.start(element);
+        if (range.getMin() != null) {
+            xml.elem("Min", String.valueOf(range.getMin()));
+        }
+        if (range.getMax() != null) {
+            xml.elem("Max", String.valueOf(range.getMax()));
+        }
+        xml.end(element);
+    }
+
+    private static void appendStringMemberListXml(XmlBuilder xml, String element, List<String> values) {
+        if (values == null || values.isEmpty()) {
+            return;
+        }
+        xml.start(element);
+        for (String value : values) {
+            xml.elem("member", value);
+        }
+        xml.end(element);
     }
 
     private static void appendMixedLaunchTemplateSpecificationXml(
@@ -853,10 +961,17 @@ public class AutoScalingQueryHandler {
         return ok(xml.build());
     }
 
+    private static final String TTC = "TargetTrackingConfiguration.";
+    private static final String CUSTOM = TTC + "CustomizedMetricSpecification.";
+
     private static ScalingPolicy.TargetTrackingConfiguration parseTargetTrackingConfiguration(MultivaluedMap<String, String> p) {
-        String predefinedMetricType = p.getFirst("TargetTrackingConfiguration.PredefinedMetricSpecification.PredefinedMetricType");
-        Double targetValue = nullableDoubleParam(p, "TargetTrackingConfiguration.TargetValue");
-        if (predefinedMetricType == null && targetValue == null) {
+        String predefinedMetricType = p.getFirst(TTC + "PredefinedMetricSpecification.PredefinedMetricType");
+        String customMetricName = p.getFirst(CUSTOM + "MetricName");
+        String firstMetricQueryId = p.getFirst(CUSTOM + "Metrics.member.1.Id");
+        Double targetValue = nullableDoubleParam(p, TTC + "TargetValue");
+        String disableScaleIn = p.getFirst(TTC + "DisableScaleIn");
+        if (predefinedMetricType == null && customMetricName == null && firstMetricQueryId == null
+                && targetValue == null && disableScaleIn == null) {
             return null;
         }
         ScalingPolicy.TargetTrackingConfiguration configuration = new ScalingPolicy.TargetTrackingConfiguration();
@@ -864,10 +979,105 @@ public class AutoScalingQueryHandler {
             ScalingPolicy.PredefinedMetricSpecification specification =
                     new ScalingPolicy.PredefinedMetricSpecification();
             specification.setPredefinedMetricType(predefinedMetricType);
+            specification.setResourceLabel(
+                    p.getFirst(TTC + "PredefinedMetricSpecification.ResourceLabel"));
             configuration.setPredefinedMetricSpecification(specification);
         }
+        if (customMetricName != null || firstMetricQueryId != null) {
+            configuration.setCustomizedMetricSpecification(parseCustomizedMetricSpecification(p));
+        }
         configuration.setTargetValue(targetValue);
+        configuration.setDisableScaleIn(
+                parseOptionalBoolean(disableScaleIn, "DisableScaleIn"));
         return configuration;
+    }
+
+    private static ScalingPolicy.CustomizedMetricSpecification parseCustomizedMetricSpecification(
+            MultivaluedMap<String, String> p) {
+        ScalingPolicy.CustomizedMetricSpecification spec = new ScalingPolicy.CustomizedMetricSpecification();
+        spec.setMetricName(p.getFirst(CUSTOM + "MetricName"));
+        spec.setNamespace(p.getFirst(CUSTOM + "Namespace"));
+        spec.setStatistic(p.getFirst(CUSTOM + "Statistic"));
+        spec.setUnit(p.getFirst(CUSTOM + "Unit"));
+        spec.setPeriod(parseMetricPeriod(p.getFirst(CUSTOM + "Period"), "Period"));
+        // Numbered members are read from 1 up to the first gap, the same reading the other Query
+        // handlers apply. The model requires both Name and Value on a dimension.
+        List<ScalingPolicy.MetricDimension> dimensions = new ArrayList<>();
+        for (int i = 1; p.getFirst(CUSTOM + "Dimensions.member." + i + ".Name") != null; i++) {
+            ScalingPolicy.MetricDimension dimension = new ScalingPolicy.MetricDimension();
+            dimension.setName(p.getFirst(CUSTOM + "Dimensions.member." + i + ".Name"));
+            dimension.setValue(p.getFirst(CUSTOM + "Dimensions.member." + i + ".Value"));
+            dimensions.add(dimension);
+        }
+        spec.setDimensions(dimensions);
+        spec.setMetrics(parseMetricDataQueries(p));
+        return spec;
+    }
+
+    /**
+     * Integer.valueOf on a client-supplied value threw straight out of the handler, so a
+     * non-numeric Period was reported as InternalFailure. A bad request member is a parameter
+     * error.
+     */
+    private static Integer parseMetricPeriod(String value, String member) {
+        if (value == null || value.isBlank()) {
+            return null;
+        }
+        int parsed;
+        try {
+            parsed = Integer.parseInt(value.trim());
+        } catch (NumberFormatException e) {
+            throw new AwsException("ValidationError",
+                    member + " must be an integer.", 400);
+        }
+        if (parsed <= 0) {
+            throw new AwsException("ValidationError",
+                    member + " must be greater than zero.", 400);
+        }
+        return parsed;
+    }
+
+    /** CustomizedMetricSpecification.Metrics, the metric data query form. */
+    private static List<ScalingPolicy.TargetTrackingMetricDataQuery> parseMetricDataQueries(
+            MultivaluedMap<String, String> p) {
+        List<ScalingPolicy.TargetTrackingMetricDataQuery> queries = new ArrayList<>();
+        for (int i = 1; p.getFirst(CUSTOM + "Metrics.member." + i + ".Id") != null; i++) {
+            String base = CUSTOM + "Metrics.member." + i + ".";
+            ScalingPolicy.TargetTrackingMetricDataQuery query =
+                    new ScalingPolicy.TargetTrackingMetricDataQuery();
+            query.setId(p.getFirst(base + "Id"));
+            query.setExpression(p.getFirst(base + "Expression"));
+            query.setLabel(p.getFirst(base + "Label"));
+            query.setPeriod(parseMetricPeriod(p.getFirst(base + "Period"),
+                    "Metrics.member." + i + ".Period"));
+            query.setReturnData(parseOptionalBoolean(
+                    p.getFirst(base + "ReturnData"), "ReturnData"));
+            String stat = p.getFirst(base + "MetricStat.Stat");
+            if (stat != null) {
+                ScalingPolicy.TargetTrackingMetricStat metricStat =
+                        new ScalingPolicy.TargetTrackingMetricStat();
+                metricStat.setStat(stat);
+                metricStat.setUnit(p.getFirst(base + "MetricStat.Unit"));
+                metricStat.setPeriod(parseMetricPeriod(
+                        p.getFirst(base + "MetricStat.Period"), "MetricStat.Period"));
+                ScalingPolicy.Metric metric = new ScalingPolicy.Metric();
+                metric.setNamespace(p.getFirst(base + "MetricStat.Metric.Namespace"));
+                metric.setMetricName(p.getFirst(base + "MetricStat.Metric.MetricName"));
+                List<ScalingPolicy.MetricDimension> metricDimensions = new ArrayList<>();
+                String dimensionBase = base + "MetricStat.Metric.Dimensions.member.";
+                for (int d = 1; p.getFirst(dimensionBase + d + ".Name") != null; d++) {
+                    ScalingPolicy.MetricDimension dimension = new ScalingPolicy.MetricDimension();
+                    dimension.setName(p.getFirst(dimensionBase + d + ".Name"));
+                    dimension.setValue(p.getFirst(dimensionBase + d + ".Value"));
+                    metricDimensions.add(dimension);
+                }
+                metric.setDimensions(metricDimensions);
+                metricStat.setMetric(metric);
+                query.setMetricStat(metricStat);
+            }
+            queries.add(query);
+        }
+        return queries;
     }
 
     private static void appendTargetTrackingConfigurationXml(
@@ -883,12 +1093,90 @@ public class AutoScalingQueryHandler {
             if (predefinedMetric.getPredefinedMetricType() != null) {
                 xml.elem("PredefinedMetricType", predefinedMetric.getPredefinedMetricType());
             }
+            if (predefinedMetric.getResourceLabel() != null) {
+                xml.elem("ResourceLabel", predefinedMetric.getResourceLabel());
+            }
             xml.end("PredefinedMetricSpecification");
         }
+        appendCustomizedMetricSpecificationXml(xml, configuration.getCustomizedMetricSpecification());
         if (configuration.getTargetValue() != null) {
             xml.elem("TargetValue", String.valueOf(configuration.getTargetValue()));
         }
+        if (configuration.getDisableScaleIn() != null) {
+            xml.elem("DisableScaleIn", String.valueOf(configuration.getDisableScaleIn()));
+        }
         xml.end("TargetTrackingConfiguration");
+    }
+
+    private static void appendCustomizedMetricSpecificationXml(
+            XmlBuilder xml, ScalingPolicy.CustomizedMetricSpecification spec) {
+        if (spec == null) {
+            return;
+        }
+        xml.start("CustomizedMetricSpecification");
+        if (!spec.getDimensions().isEmpty()) {
+            xml.start("Dimensions");
+            for (ScalingPolicy.MetricDimension dimension : spec.getDimensions()) {
+                xml.start("member")
+                   .elem("Name", dimension.getName())
+                   .elem("Value", dimension.getValue())
+                   .end("member");
+            }
+            xml.end("Dimensions");
+        }
+        if (spec.getMetricName() != null) { xml.elem("MetricName", spec.getMetricName()); }
+        if (spec.getNamespace() != null) { xml.elem("Namespace", spec.getNamespace()); }
+        if (spec.getStatistic() != null) { xml.elem("Statistic", spec.getStatistic()); }
+        if (spec.getUnit() != null) { xml.elem("Unit", spec.getUnit()); }
+        if (spec.getPeriod() != null) { xml.elem("Period", String.valueOf(spec.getPeriod())); }
+        appendMetricDataQueriesXml(xml, spec.getMetrics());
+        xml.end("CustomizedMetricSpecification");
+    }
+
+    private static void appendMetricDataQueriesXml(
+            XmlBuilder xml, List<ScalingPolicy.TargetTrackingMetricDataQuery> queries) {
+        if (queries == null || queries.isEmpty()) {
+            return;
+        }
+        xml.start("Metrics");
+        for (ScalingPolicy.TargetTrackingMetricDataQuery query : queries) {
+            xml.start("member").elem("Id", query.getId());
+            if (query.getExpression() != null) { xml.elem("Expression", query.getExpression()); }
+            if (query.getLabel() != null) { xml.elem("Label", query.getLabel()); }
+            if (query.getPeriod() != null) {
+                xml.elem("Period", String.valueOf(query.getPeriod()));
+            }
+            if (query.getReturnData() != null) {
+                xml.elem("ReturnData", String.valueOf(query.getReturnData()));
+            }
+            ScalingPolicy.TargetTrackingMetricStat stat = query.getMetricStat();
+            if (stat != null) {
+                xml.start("MetricStat");
+                ScalingPolicy.Metric metric = stat.getMetric();
+                if (metric != null) {
+                    xml.start("Metric")
+                       .elem("Namespace", metric.getNamespace())
+                       .elem("MetricName", metric.getMetricName());
+                    if (!metric.getDimensions().isEmpty()) {
+                        xml.start("Dimensions");
+                        for (ScalingPolicy.MetricDimension dimension : metric.getDimensions()) {
+                            xml.start("member")
+                               .elem("Name", dimension.getName())
+                               .elem("Value", dimension.getValue())
+                               .end("member");
+                        }
+                        xml.end("Dimensions");
+                    }
+                    xml.end("Metric");
+                }
+                xml.elem("Stat", stat.getStat());
+                if (stat.getUnit() != null) { xml.elem("Unit", stat.getUnit()); }
+                if (stat.getPeriod() != null) { xml.elem("Period", String.valueOf(stat.getPeriod())); }
+                xml.end("MetricStat");
+            }
+            xml.end("member");
+        }
+        xml.end("Metrics");
     }
 
     // ── Activities ────────────────────────────────────────────────────────────
@@ -1084,19 +1372,90 @@ public class AutoScalingQueryHandler {
         return false;
     }
 
+    // An override that sets only InstanceRequirements is legal, and mutually exclusive with
+    // InstanceType, so InstanceType's presence cannot be the loop's "is there another override"
+    // signal. Using it as one dropped the whole Overrides list rather than one member of it.
     private List<MixedInstancesPolicy.LaunchTemplateOverride> parseMixedLaunchTemplateOverrides(
             MultivaluedMap<String, String> p) {
         List<MixedInstancesPolicy.LaunchTemplateOverride> result = new ArrayList<>();
         for (int i = 1; ; i++) {
-            String instanceType = p.getFirst("MixedInstancesPolicy.LaunchTemplate.Overrides.member."
-                    + i + ".InstanceType");
-            if (instanceType == null) { break; }
+            String prefix = "MixedInstancesPolicy.LaunchTemplate.Overrides.member." + i;
+            if (!hasAnyPrefix(p, prefix + ".")) {
+                break;
+            }
             MixedInstancesPolicy.LaunchTemplateOverride override =
                     new MixedInstancesPolicy.LaunchTemplateOverride();
-            override.setInstanceType(instanceType);
+            override.setInstanceType(p.getFirst(prefix + ".InstanceType"));
+            override.setInstanceRequirements(parseInstanceRequirements(p, prefix + ".InstanceRequirements"));
             result.add(override);
         }
         return result;
+    }
+
+    private MixedInstancesPolicy.InstanceRequirements parseInstanceRequirements(
+            MultivaluedMap<String, String> p, String prefix) {
+        if (!hasAnyPrefix(p, prefix + ".")) {
+            return null;
+        }
+        MixedInstancesPolicy.InstanceRequirements requirements =
+                new MixedInstancesPolicy.InstanceRequirements();
+        requirements.setVCpuCount(parseIntRange(p, prefix + ".VCpuCount"));
+        requirements.setMemoryMiB(parseIntRange(p, prefix + ".MemoryMiB"));
+        requirements.setNetworkInterfaceCount(parseIntRange(p, prefix + ".NetworkInterfaceCount"));
+        requirements.setAcceleratorCount(parseIntRange(p, prefix + ".AcceleratorCount"));
+        requirements.setAcceleratorTotalMemoryMiB(parseIntRange(p, prefix + ".AcceleratorTotalMemoryMiB"));
+        requirements.setBaselineEbsBandwidthMbps(parseIntRange(p, prefix + ".BaselineEbsBandwidthMbps"));
+        requirements.setMemoryGiBPerVCpu(parseDoubleRange(p, prefix + ".MemoryGiBPerVCpu"));
+        requirements.setTotalLocalStorageGB(parseDoubleRange(p, prefix + ".TotalLocalStorageGB"));
+        requirements.setNetworkBandwidthGbps(parseDoubleRange(p, prefix + ".NetworkBandwidthGbps"));
+        requirements.setCpuManufacturers(memberList(p, prefix + ".CpuManufacturers"));
+        requirements.setExcludedInstanceTypes(memberList(p, prefix + ".ExcludedInstanceTypes"));
+        requirements.setInstanceGenerations(memberList(p, prefix + ".InstanceGenerations"));
+        requirements.setLocalStorageTypes(memberList(p, prefix + ".LocalStorageTypes"));
+        requirements.setAcceleratorTypes(memberList(p, prefix + ".AcceleratorTypes"));
+        requirements.setAcceleratorManufacturers(memberList(p, prefix + ".AcceleratorManufacturers"));
+        requirements.setAcceleratorNames(memberList(p, prefix + ".AcceleratorNames"));
+        requirements.setAllowedInstanceTypes(memberList(p, prefix + ".AllowedInstanceTypes"));
+        requirements.setSpotMaxPricePercentageOverLowestPrice(parseOptionalInt(p.getFirst(prefix + ".SpotMaxPricePercentageOverLowestPrice"), prefix + ".SpotMaxPricePercentageOverLowestPrice"));
+        requirements.setMaxSpotPriceAsPercentageOfOptimalOnDemandPrice(parseOptionalInt(p.getFirst(prefix + ".MaxSpotPriceAsPercentageOfOptimalOnDemandPrice"), prefix + ".MaxSpotPriceAsPercentageOfOptimalOnDemandPrice"));
+        requirements.setOnDemandMaxPricePercentageOverLowestPrice(parseOptionalInt(p.getFirst(prefix + ".OnDemandMaxPricePercentageOverLowestPrice"), prefix + ".OnDemandMaxPricePercentageOverLowestPrice"));
+        requirements.setBareMetal(p.getFirst(prefix + ".BareMetal"));
+        requirements.setBurstablePerformance(p.getFirst(prefix + ".BurstablePerformance"));
+        requirements.setLocalStorage(p.getFirst(prefix + ".LocalStorage"));
+        requirements.setRequireHibernateSupport(parseOptionalBoolean(p.getFirst(prefix + ".RequireHibernateSupport"), prefix + ".RequireHibernateSupport"));
+        return requirements.isEmpty() ? null : requirements;
+    }
+
+    private MixedInstancesPolicy.IntRange parseIntRange(MultivaluedMap<String, String> p, String prefix) {
+        Integer min = parseOptionalInt(p.getFirst(prefix + ".Min"), prefix + ".Min");
+        Integer max = parseOptionalInt(p.getFirst(prefix + ".Max"), prefix + ".Max");
+        if (min == null && max == null) {
+            return null;
+        }
+        MixedInstancesPolicy.IntRange range = new MixedInstancesPolicy.IntRange();
+        range.setMin(min);
+        range.setMax(max);
+        return range;
+    }
+
+    private MixedInstancesPolicy.DoubleRange parseDoubleRange(MultivaluedMap<String, String> p, String prefix) {
+        Double min = nullableDoubleParam(p, prefix + ".Min");
+        Double max = nullableDoubleParam(p, prefix + ".Max");
+        if (min == null && max == null) {
+            return null;
+        }
+        MixedInstancesPolicy.DoubleRange range = new MixedInstancesPolicy.DoubleRange();
+        range.setMin(min);
+        range.setMax(max);
+        return range;
+    }
+
+    private AsgOptionalFields parseAsgOptionalFields(MultivaluedMap<String, String> p) {
+        return new AsgOptionalFields(
+                p.getFirst("DesiredCapacityType"),
+                nullableBoolParam(p, "CapacityRebalance"),
+                parseOptionalInt(p.getFirst("MaxInstanceLifetime"), "MaxInstanceLifetime"),
+                parseOptionalInt(p.getFirst("DefaultInstanceWarmup"), "DefaultInstanceWarmup"));
     }
 
     private ParsedTags parseTags(MultivaluedMap<String, String> p) {
@@ -1395,7 +1754,102 @@ public class AutoScalingQueryHandler {
     private Boolean nullableBoolParam(MultivaluedMap<String, String> p, String key) {
         String val = p.getFirst(key);
         if (val == null || val.isBlank()) { return null; }
-        return Boolean.parseBoolean(val);
+        return parseOptionalBoolean(val, key);
+    }
+
+    private List<LaunchConfigurationBlockDeviceMapping> parseLaunchConfigurationBlockDeviceMappings(
+            MultivaluedMap<String, String> p) {
+        List<LaunchConfigurationBlockDeviceMapping> mappings = new ArrayList<>();
+        for (int i = 1; ; i++) {
+            String prefix = "BlockDeviceMappings.member." + i;
+            String deviceName = p.getFirst(prefix + ".DeviceName");
+            String virtualName = p.getFirst(prefix + ".VirtualName");
+            String noDevice = p.getFirst(prefix + ".NoDevice");
+            String snapshotId = p.getFirst(prefix + ".Ebs.SnapshotId");
+            String volumeSize = p.getFirst(prefix + ".Ebs.VolumeSize");
+            String volumeType = p.getFirst(prefix + ".Ebs.VolumeType");
+            String deleteOnTermination = p.getFirst(prefix + ".Ebs.DeleteOnTermination");
+            String iops = p.getFirst(prefix + ".Ebs.Iops");
+            String throughput = p.getFirst(prefix + ".Ebs.Throughput");
+            String encrypted = p.getFirst(prefix + ".Ebs.Encrypted");
+            boolean hasEbs = snapshotId != null || volumeSize != null || volumeType != null
+                    || deleteOnTermination != null || iops != null || throughput != null || encrypted != null;
+            if (deviceName == null && virtualName == null && noDevice == null && !hasEbs) {
+                break;
+            }
+            if (deviceName == null || deviceName.isBlank()) {
+                throw new AwsException("ValidationError",
+                        "1 validation error detected: Value null at '" + prefix
+                                + ".DeviceName' failed to satisfy constraint: Member must not be null", 400);
+            }
+            LaunchConfigurationBlockDeviceMapping mapping = new LaunchConfigurationBlockDeviceMapping();
+            mapping.setDeviceName(deviceName);
+            mapping.setVirtualName(virtualName);
+            mapping.setNoDevice(parseOptionalBoolean(noDevice, prefix + ".NoDevice"));
+            if (hasEbs) {
+                LaunchConfigurationBlockDeviceMapping.Ebs ebs = new LaunchConfigurationBlockDeviceMapping.Ebs();
+                ebs.setSnapshotId(snapshotId);
+                ebs.setVolumeSize(parseOptionalInt(volumeSize, prefix + ".Ebs.VolumeSize"));
+                ebs.setVolumeType(volumeType);
+                ebs.setDeleteOnTermination(parseOptionalBoolean(deleteOnTermination, prefix + ".Ebs.DeleteOnTermination"));
+                ebs.setIops(parseOptionalInt(iops, prefix + ".Ebs.Iops"));
+                ebs.setThroughput(parseOptionalInt(throughput, prefix + ".Ebs.Throughput"));
+                ebs.setEncrypted(parseOptionalBoolean(encrypted, prefix + ".Ebs.Encrypted"));
+                mapping.setEbs(ebs);
+            }
+            mappings.add(mapping);
+        }
+        return mappings;
+    }
+
+    private Integer parseOptionalInt(String value, String name) {
+        if (value == null || value.isBlank()) {
+            return null;
+        }
+        try {
+            return Integer.parseInt(value);
+        } catch (NumberFormatException e) {
+            throw new AwsException("ValidationError", name + " must be an integer.", 400);
+        }
+    }
+
+    private static Boolean parseOptionalBoolean(String value, String name) {
+        if (value == null || value.isBlank()) {
+            return null;
+        }
+        if ("true".equalsIgnoreCase(value) || "false".equalsIgnoreCase(value)) {
+            return Boolean.parseBoolean(value);
+        }
+        throw new AwsException("ValidationError", name + " must be true or false.", 400);
+    }
+
+    // AWS returns an empty list when the launch configuration carries no mappings, so the
+    // element is always present.
+    private void writeLaunchConfigurationBlockDeviceMappings(
+            XmlBuilder xml, List<LaunchConfigurationBlockDeviceMapping> mappings) {
+        xml.start("BlockDeviceMappings");
+        for (LaunchConfigurationBlockDeviceMapping mapping : mappings != null ? mappings : List.<LaunchConfigurationBlockDeviceMapping>of()) {
+            xml.start("member");
+            if (mapping.getVirtualName() != null) { xml.elem("VirtualName", mapping.getVirtualName()); }
+            if (mapping.getDeviceName() != null) { xml.elem("DeviceName", mapping.getDeviceName()); }
+            if (mapping.getNoDevice() != null) { xml.elem("NoDevice", String.valueOf(mapping.getNoDevice())); }
+            LaunchConfigurationBlockDeviceMapping.Ebs ebs = mapping.getEbs();
+            if (ebs != null) {
+                xml.start("Ebs");
+                if (ebs.getSnapshotId() != null) { xml.elem("SnapshotId", ebs.getSnapshotId()); }
+                if (ebs.getVolumeSize() != null) { xml.elem("VolumeSize", String.valueOf(ebs.getVolumeSize())); }
+                if (ebs.getVolumeType() != null) { xml.elem("VolumeType", ebs.getVolumeType()); }
+                if (ebs.getDeleteOnTermination() != null) {
+                    xml.elem("DeleteOnTermination", String.valueOf(ebs.getDeleteOnTermination()));
+                }
+                if (ebs.getIops() != null) { xml.elem("Iops", String.valueOf(ebs.getIops())); }
+                if (ebs.getThroughput() != null) { xml.elem("Throughput", String.valueOf(ebs.getThroughput())); }
+                if (ebs.getEncrypted() != null) { xml.elem("Encrypted", String.valueOf(ebs.getEncrypted())); }
+                xml.end("Ebs");
+            }
+            xml.end("member");
+        }
+        xml.end("BlockDeviceMappings");
     }
 
     /** A required boolean member must be present and exactly "true"/"false" — never silently coerced to false. */
@@ -1411,7 +1865,7 @@ public class AutoScalingQueryHandler {
                     "1 validation error detected: Value '" + val + "' at '" + key
                             + "' failed to satisfy constraint: Member must be a valid boolean", 400);
         }
-        return Boolean.parseBoolean(val);
+        return parseOptionalBoolean(val, key);
     }
 
     private String intString(Integer value) {

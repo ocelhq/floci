@@ -6,6 +6,9 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.RestAssured;
 import io.restassured.parsing.Parser;
+import io.restassured.response.ExtractableResponse;
+import io.restassured.response.Response;
+import io.restassured.specification.RequestSpecification;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
@@ -15,6 +18,7 @@ import static io.restassured.config.EncoderConfig.encoderConfig;
 import static io.restassured.config.RestAssuredConfig.config;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.containsString;
+import static org.hamcrest.Matchers.equalTo;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -27,6 +31,10 @@ class CloudControlIntegrationTest {
             "AWS4-HMAC-SHA256 Credential=test/20260205/us-east-1/ec2/aws4_request";
     private static final String IAM_AUTH =
             "AWS4-HMAC-SHA256 Credential=test/20260227/us-east-1/iam/aws4_request";
+    private static final String ACCOUNT_A_AUTH =
+            "AWS4-HMAC-SHA256 Credential=111111111111/20260227/us-east-1/cloudcontrol/aws4_request";
+    private static final String ACCOUNT_B_AUTH =
+            "AWS4-HMAC-SHA256 Credential=222222222222/20260227/us-east-1/cloudcontrol/aws4_request";
     private static final String TRUST_POLICY =
             "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\","
                     + "\"Principal\":{\"Service\":\"lambda.amazonaws.com\"},\"Action\":\"sts:AssumeRole\"}]}";
@@ -121,7 +129,7 @@ class CloudControlIntegrationTest {
         // Poll GetResourceRequestStatus until the async provision reaches SUCCESS.
         String identifier = null;
         for (int i = 0; i < 20 && identifier == null; i++) {
-            var pe = given()
+            ExtractableResponse<Response> pe = given()
                     .config(config().encoderConfig(encoderConfig().encodeContentTypeAs(ct, TEXT)))
                     .contentType(ct)
                     .header("X-Amz-Target", "CloudApiService.GetResourceRequestStatus")
@@ -139,6 +147,32 @@ class CloudControlIntegrationTest {
 
         // The created VPC is now visible on the read side.
         assertListed("AWS::EC2::VPC", identifier, "VpcId", ct);
+    }
+
+    @Test
+    void cloudControlResourcesAndTokensAreIsolatedByAccount() throws InterruptedException {
+        String ct = "application/x-amz-json-1.0";
+        String tokenA = createVpcThroughCloudControl(ct, ACCOUNT_A_AUTH, "10.81.0.0/16");
+        String tokenB = createVpcThroughCloudControl(ct, ACCOUNT_B_AUTH, "10.82.0.0/16");
+        String vpcA = awaitIdentifier(tokenA, ct, ACCOUNT_A_AUTH);
+        String vpcB = awaitIdentifier(tokenB, ct, ACCOUNT_B_AUTH);
+
+        assertListedWithAuth("AWS::EC2::VPC", vpcA, ACCOUNT_A_AUTH, ct);
+        assertListedWithAuth("AWS::EC2::VPC", vpcB, ACCOUNT_B_AUTH, ct);
+        assertNotFoundWithAuth("AWS::EC2::VPC", vpcA, ACCOUNT_B_AUTH, ct);
+        assertNotFoundWithAuth("AWS::EC2::VPC", vpcB, ACCOUNT_A_AUTH, ct);
+
+        given().config(config().encoderConfig(encoderConfig().encodeContentTypeAs(ct, TEXT)))
+                .contentType(ct).header("Authorization", ACCOUNT_B_AUTH)
+                .header("X-Amz-Target", "CloudApiService.GetResourceRequestStatus")
+                .body("{\"RequestToken\":\"" + tokenA + "\"}")
+                .when().post("/").then().statusCode(404)
+                .body("__type", containsString("RequestTokenNotFoundException"));
+
+        deleteThroughCloudControl(ct, ACCOUNT_B_AUTH, vpcA, "FAILED");
+        assertListedWithAuth("AWS::EC2::VPC", vpcA, ACCOUNT_A_AUTH, ct);
+        deleteThroughCloudControl(ct, ACCOUNT_A_AUTH, vpcA, "SUCCESS");
+        deleteThroughCloudControl(ct, ACCOUNT_B_AUTH, vpcB, "SUCCESS");
     }
 
     @Test
@@ -194,7 +228,7 @@ class CloudControlIntegrationTest {
                 .body("{\"TypeName\":\"AWS::S3::Bucket\"}")
                 .when().post("/")
                 .then().statusCode(200)
-                .body("TypeName", org.hamcrest.Matchers.equalTo("AWS::S3::Bucket"));
+                .body("TypeName", equalTo("AWS::S3::Bucket"));
     }
 
     private void assertErrorCode(String contentType, String target, String body) {
@@ -254,19 +288,38 @@ class CloudControlIntegrationTest {
                 .body("{\"TypeName\":\"AWS::IAM::Policy\",\"Identifier\":\"never-created\"}")
                 .when().post("/")
                 .then().statusCode(200)
-                .body("ProgressEvent.OperationStatus", org.hamcrest.Matchers.equalTo("FAILED"));
+                .body("ProgressEvent.OperationStatus", equalTo("FAILED"));
+    }
+
+    private String createVpcThroughCloudControl(String ct, String auth, String cidr) {
+        return given().config(config().encoderConfig(encoderConfig().encodeContentTypeAs(ct, TEXT)))
+                .contentType(ct).header("Authorization", auth)
+                .header("X-Amz-Target", "CloudApiService.CreateResource")
+                .body("{\"TypeName\":\"AWS::EC2::VPC\",\"DesiredState\":\"{\\\"CidrBlock\\\":\\\"" + cidr + "\\\"}\"}")
+                .when().post("/").then().statusCode(200)
+                .extract().path("ProgressEvent.RequestToken");
+    }
+
+    private void deleteThroughCloudControl(String ct, String auth, String identifier, String status) {
+        given().config(config().encoderConfig(encoderConfig().encodeContentTypeAs(ct, TEXT)))
+                .contentType(ct).header("Authorization", auth)
+                .header("X-Amz-Target", "CloudApiService.DeleteResource")
+                .body("{\"TypeName\":\"AWS::EC2::VPC\",\"Identifier\":\"" + identifier + "\"}")
+                .when().post("/").then().statusCode(200)
+                .body("ProgressEvent.OperationStatus", equalTo(status));
     }
 
     private String awaitIdentifier(String token, String ct) throws InterruptedException {
+        return awaitIdentifier(token, ct, null);
+    }
+
+    private String awaitIdentifier(String token, String ct, String auth) throws InterruptedException {
         for (int i = 0; i < 20; i++) {
-            var pe = given()
-                    .config(config().encoderConfig(encoderConfig().encodeContentTypeAs(ct, TEXT)))
-                    .contentType(ct)
-                    .header("X-Amz-Target", "CloudApiService.GetResourceRequestStatus")
-                    .body("{\"RequestToken\":\"" + token + "\"}")
-                    .when().post("/")
-                    .then().statusCode(200)
-                    .extract();
+            RequestSpecification request = given().config(config().encoderConfig(encoderConfig().encodeContentTypeAs(ct, TEXT)))
+                    .contentType(ct).header("X-Amz-Target", "CloudApiService.GetResourceRequestStatus");
+            if (auth != null) request.header("Authorization", auth);
+            ExtractableResponse<Response> pe = request.body("{\"RequestToken\":\"" + token + "\"}")
+                    .when().post("/").then().statusCode(200).extract();
             if ("SUCCESS".equals(pe.path("ProgressEvent.OperationStatus"))) {
                 return pe.path("ProgressEvent.Identifier");
             }
@@ -363,6 +416,24 @@ class CloudControlIntegrationTest {
                         && tag.path("Key").isTextual()
                         && value.equals(tag.path("Value").asText())
                         && tag.path("Value").isTextual()));
+    }
+
+    private void assertListedWithAuth(String typeName, String identifier, String auth, String contentType) {
+        String body = given().config(config().encoderConfig(encoderConfig().encodeContentTypeAs(contentType, TEXT)))
+                .contentType(contentType).header("Authorization", auth)
+                .header("X-Amz-Target", "CloudApiService.ListResources")
+                .body("{\"TypeName\":\"" + typeName + "\"}")
+                .when().post("/").then().statusCode(200).extract().asString();
+        assertThat(body, containsString("\"Identifier\":\"" + identifier + "\""));
+    }
+
+    private void assertNotFoundWithAuth(String typeName, String identifier, String auth, String contentType) {
+        given().config(config().encoderConfig(encoderConfig().encodeContentTypeAs(contentType, TEXT)))
+                .contentType(contentType).header("Authorization", auth)
+                .header("X-Amz-Target", "CloudApiService.GetResource")
+                .body("{\"TypeName\":\"" + typeName + "\",\"Identifier\":\"" + identifier + "\"}")
+                .when().post("/").then().statusCode(404)
+                .body("__type", containsString("ResourceNotFoundException"));
     }
 
     private String listResources(String typeName, String contentType) {

@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.s3;
 
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.XmlParser;
 import io.github.hectorvent.floci.core.storage.InMemoryStorage;
 import io.github.hectorvent.floci.services.s3.model.CopyObjectOptions;
 import io.github.hectorvent.floci.services.s3.model.S3Object;
@@ -67,6 +68,23 @@ class S3VersioningServiceTest {
         S3Object obj = s3Service.putObject("versioned-bucket", "test.txt",
                 "data".getBytes(StandardCharsets.UTF_8), "text/plain", null);
         assertNull(obj.getVersionId());
+    }
+
+    @Test
+    void deletePreVersioningObjectByNullVersionIdRemovesObjectPermanently() {
+        s3Service.putObject("versioned-bucket", "pre-version.txt",
+                "data".getBytes(StandardCharsets.UTF_8), "text/plain", null);
+        s3Service.putBucketVersioning("versioned-bucket", "Enabled");
+
+        assertEquals("data", new String(s3Service.getObject("versioned-bucket", "pre-version.txt", "null").getData(),
+                StandardCharsets.UTF_8));
+        assertNotNull(s3Service.headObject("versioned-bucket", "pre-version.txt", "null"));
+
+        s3Service.deleteObject("versioned-bucket", "pre-version.txt", "null");
+
+        assertThrows(AwsException.class,
+                () -> s3Service.getObject("versioned-bucket", "pre-version.txt"));
+        assertDoesNotThrow(() -> s3Service.deleteBucket("versioned-bucket"));
     }
 
     @Test
@@ -350,6 +368,37 @@ class S3VersioningServiceTest {
         S3Object result = s3Service.getObject("versioned-bucket", "key");
         assertEquals("v1", new String(result.getData(), StandardCharsets.UTF_8),
                 "getObject should return the promoted version's content after deleting the latest");
+    }
+
+    @Test
+    void deleteObjectsWithExplicitVersionIdsPermanentlyDeletesVersions() {
+        s3Service.putBucketVersioning("versioned-bucket", "Enabled");
+
+        S3Object v1 = s3Service.putObject("versioned-bucket", "key",
+                "v1".getBytes(StandardCharsets.UTF_8), "text/plain", null);
+        S3Object v2 = s3Service.putObject("versioned-bucket", "key",
+                "v2".getBytes(StandardCharsets.UTF_8), "text/plain", null);
+
+        s3Service.deleteObjects("versioned-bucket", List.of(
+                new XmlParser.KeyVersion("key", v1.getVersionId()),
+                new XmlParser.KeyVersion("key", v2.getVersionId())));
+
+        S3Service.ListVersionsResult result = s3Service.listObjectVersions("versioned-bucket", null, 100, null);
+        assertTrue(result.versions().isEmpty(),
+                "batch delete with explicit VersionIds should permanently remove those versions, not place a delete marker");
+    }
+
+    @Test
+    void deleteObjectsWithNullVersionIdPermanentlyDeletesPreVersioningObject() {
+        s3Service.putObject("versioned-bucket", "key",
+                "data".getBytes(StandardCharsets.UTF_8), "text/plain", null);
+        s3Service.putBucketVersioning("versioned-bucket", "Enabled");
+
+        s3Service.deleteObjects("versioned-bucket", List.of(
+                new XmlParser.KeyVersion("key", "null")));
+
+        assertThrows(AwsException.class, () -> s3Service.getObject("versioned-bucket", "key"));
+        assertDoesNotThrow(() -> s3Service.deleteBucket("versioned-bucket"));
     }
 
 }

@@ -541,6 +541,15 @@ public class OrganizationsService implements ScpProvider {
         return requireAccount(requireOrganizationForCaller(callerAccountId), accountId);
     }
 
+    public java.util.Optional<OrganizationAccount> findAccountForPortal(String accountId) {
+        if (accountId == null || !ACCOUNT_ID_PATTERN.matcher(accountId).matches()) {
+            return java.util.Optional.empty();
+        }
+        return accounts.scanAllAccounts().stream()
+                .filter(account -> accountId.equals(account.getId()))
+                .findFirst();
+    }
+
     public List<OrganizationAccount> listAccounts(String callerAccountId) {
         Organization organization = requireOrganizationForCaller(callerAccountId);
         return accountsIn(organization).stream()
@@ -1350,6 +1359,12 @@ public class OrganizationsService implements ScpProvider {
         return Optional.empty();
     }
 
+    public boolean isManagementAccount(String accountId) {
+        return findOrganizationForAccount(accountId)
+                .map(organization -> accountId.equals(organization.getMasterAccountId()))
+                .orElse(false);
+    }
+
     private Optional<Organization> findOrganizationForAccount(String accountId) {
         for (Organization organization : organizations.scanAllAccounts()) {
             if (accountId.equals(organization.getMasterAccountId())) {
@@ -1920,6 +1935,6 @@ public class OrganizationsService implements ScpProvider {
     }
 
     private static AwsException accessDenied(String message) {
-        return new AwsException("AccessDeniedException", message, 403);
+        return new AwsException("AccessDeniedException", message, 400);
     }
 }

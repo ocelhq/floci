@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.cloudformation;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.common.ServicePrincipals;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.cloudformation.model.Stack;
@@ -43,7 +44,7 @@ import java.util.regex.Pattern;
 public class StackSetService {
 
     private static final Logger LOG = Logger.getLogger(StackSetService.class);
-    private static final String STACKSETS_SERVICE_PRINCIPAL = "stacksets.cloudformation.amazonaws.com";
+    private static final String STACKSETS_SERVICE_PRINCIPAL = ServicePrincipals.of("stacksets.cloudformation");
     private static final String INSTANCE_CHANGE_SET = "stackset-instance";
     private static final String UPDATE_CHANGE_SET = "stackset-update";
     private static final String ORGANIZATIONS_ACCESS_KEY = "organizations-access";
@@ -63,7 +64,7 @@ public class StackSetService {
     private final RegionResolver regionResolver;
 
     StackSetService(CloudFormationService cfnService, StorageFactory storageFactory) {
-        this(cfnService, storageFactory, null, new RegionResolver("us-east-1", "000000000000"));
+        this(cfnService, storageFactory, null, new RegionResolver("us-east-1", "000000000000")); // partition-literal: test-shaped constructor default
     }
 
     @Inject
@@ -232,7 +233,8 @@ public class StackSetService {
                 // INOPERABLE, updates the rest, and reports the operation FAILED. Deploying into it
                 // anyway would raise the refusal out of here and fail the whole UpdateStackSet call
                 // with a 400, updating no instance at all.
-                String stackStatus = cfnService.stackStatus(inst.getStackName(), inst.getRegion());
+                String stackStatus = cfnService.stackStatus(
+                        inst.getStackName(), inst.getRegion(), inst.getAccount());
                 if (CloudFormationService.refusesUpdate(stackStatus)) {
                     inst.setStatus("INOPERABLE");
                     inst.setDetailedStatus("FAILED");
@@ -639,7 +641,7 @@ public class StackSetService {
         inst.setRegion(region);
         inst.setStackName(stackName);
         inst.setStackId(resolveStackId(stackName, region, account));
-        List<Stack> stacks = cfnService.describeStacks(stackName, region);
+        List<Stack> stacks = cfnService.describeStacks(stackName, region, account);
         String stackStatus = stacks.isEmpty() ? null : stacks.get(0).getStatus();
         // Only a clean create/update is a success. A failed resource rolls the stack back, so its
         // terminal status is ROLLBACK_COMPLETE (not *_FAILED) — treat anything that is not COMPLETE
@@ -655,7 +657,7 @@ public class StackSetService {
     }
 
     private String resolveStackId(String stackName, String region, String account) {
-        List<Stack> stacks = cfnService.describeStacks(stackName, region);
+        List<Stack> stacks = cfnService.describeStacks(stackName, region, account);
         if (!stacks.isEmpty() && stacks.get(0).getStackId() != null) {
             return stacks.get(0).getStackId();
         }

@@ -215,7 +215,7 @@ public class AlarmEvaluator {
      * two are indistinguishable across their most recent three buckets alone.</p>
      */
     private static boolean settledBreach(Double[] buckets, MetricAlarm alarm, int evaluationPeriods) {
-        int datapointsToAlarm = alarm.getDatapointsToAlarm() > 0
+        int datapointsToAlarm = alarm.getDatapointsToAlarm() != null
                 ? alarm.getDatapointsToAlarm() : evaluationPeriods;
         int oldestBreachingAge = 0;
         for (int age = 1; age <= buckets.length; age++) {
@@ -252,7 +252,8 @@ public class AlarmEvaluator {
     }
 
     private static String evaluateBreachCount(int breaching, MetricAlarm alarm, int evaluationPeriods) {
-        int datapointsToAlarm = alarm.getDatapointsToAlarm() > 0 ? alarm.getDatapointsToAlarm() : evaluationPeriods;
+        int datapointsToAlarm = alarm.getDatapointsToAlarm() != null
+                ? alarm.getDatapointsToAlarm() : evaluationPeriods;
         return breaching >= datapointsToAlarm ? "ALARM" : "OK";
     }
 
@@ -274,9 +275,10 @@ public class AlarmEvaluator {
 
     private static boolean isEvaluable(MetricAlarm alarm) {
         return alarm.getRegion() != null
+                && alarm.getMetrics().isEmpty()
                 && alarm.getNamespace() != null && !alarm.getNamespace().isBlank()
                 && alarm.getMetricName() != null && !alarm.getMetricName().isBlank()
-                && alarm.getPeriod() > 0
+                && alarm.getPeriod() != null && alarm.getPeriod() > 0
                 && alarm.getEvaluationPeriods() > 0
                 && alarm.getComparisonOperator() != null;
     }

@@ -1,8 +1,10 @@
 package io.github.hectorvent.floci.config;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.github.hectorvent.floci.core.common.AwsRegions;
 import io.github.hectorvent.floci.services.acm.CertificateGenerator;
 import io.github.hectorvent.floci.services.acm.model.KeyAlgorithm;
+import org.bouncycastle.asn1.x509.Extension;
 import org.eclipse.microprofile.config.spi.ConfigSource;
 import org.jboss.logging.Logger;
 
@@ -45,6 +47,16 @@ public class TlsConfigSource implements ConfigSource {
 
     private static final Logger LOG = Logger.getLogger(TlsConfigSource.class);
 
+    static final String NAME = "FlociTlsConfigSource";
+
+    /**
+     * Internal ports Quarkus binds when TLS is enabled. {@link TlsProxyServer} listens on the
+     * public Floci port and routes to these by protocol, so the two classes must agree; they are
+     * declared here, next to the properties that set them, and referenced from the proxy.
+     */
+    static final int HTTP_INTERNAL_PORT = 4510;
+    static final int HTTPS_INTERNAL_PORT = 4511;
+
     private static final String SERVER_CERT_NAME = "floci-server.crt";
     private static final String SERVER_KEY_NAME = "floci-server.key";
     private static final String SERVER_METADATA_NAME = "floci-server.metadata.json";
@@ -52,11 +64,23 @@ public class TlsConfigSource implements ConfigSource {
     private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
 
     // host.docker.internal: how Lambda containers reach Floci when it runs on the host (not in a container).
-    private static final List<String> DEFAULT_SAN_HOSTNAMES = List.of(
-            "localhost", "127.0.0.1", "0.0.0.0", "*.localhost",
-            "localhost.floci.io", "*.localhost.floci.io",
-            "*.execute-api.localhost.floci.io",
-            "*.execute-api.localhost.localstack.cloud", "host.docker.internal");
+    // A wildcard SAN covers one label, so every two-label service form needs its own entry.
+    // Package-private so the tests assert against this list instead of copying it.
+    static final List<String> DEFAULT_SAN_HOSTNAMES = defaultSanHostnames();
+
+    private static List<String> defaultSanHostnames() {
+        List<String> sans = new ArrayList<>(List.of(
+                "localhost", "127.0.0.1", "0.0.0.0", "*.localhost",
+                "localhost.floci.io", "*.localhost.floci.io",
+                "*.execute-api.localhost.floci.io",
+                "*.execute-api.localhost.localstack.cloud",
+                "*.cloudfront.localhost.floci.io", "*.cloudfront.localhost",
+                "host.docker.internal"));
+        for (String region : AwsRegions.KNOWN_IDS.stream().sorted().toList()) {
+            sans.add("*.dkr.ecr." + region + ".localhost.floci.io");
+        }
+        return List.copyOf(sans);
+    }
 
     private static volatile Path resolvedTlsDir;
 
@@ -136,8 +160,8 @@ public class TlsConfigSource implements ConfigSource {
         // and does protocol detection to route HTTP and HTTPS to the correct backend.
         properties.put("quarkus.http.insecure-requests", "enabled");
         properties.put("quarkus.http.host", "127.0.0.1");
-        properties.put("quarkus.http.port", "4510");
-        properties.put("quarkus.http.ssl-port", "4511");
+        properties.put("quarkus.http.port", String.valueOf(HTTP_INTERNAL_PORT));
+        properties.put("quarkus.http.ssl-port", String.valueOf(HTTPS_INTERNAL_PORT));
 
         LOG.infov("TLS: HTTPS enabled, proxy will listen on port {0} (HTTP+HTTPS), cert={1}",
                 resolveProperty("floci.port", "4566"), certPath);
@@ -161,7 +185,7 @@ public class TlsConfigSource implements ConfigSource {
 
     @Override
     public String getName() {
-        return "FlociTlsConfigSource";
+        return NAME;
     }
 
     /**
@@ -289,6 +313,11 @@ public class TlsConfigSource implements ConfigSource {
                 LOG.infov("TLS: existing server certificate was not issued by the local CA; regenerating");
                 return false;
             }
+            if (cert.getExtensionValue(Extension.subjectKeyIdentifier.getId()) == null
+                    || cert.getExtensionValue(Extension.authorityKeyIdentifier.getId()) == null) {
+                LOG.info("TLS: existing server certificate lacks key identifiers; regenerating");
+                return false;
+            }
             cert.checkValidity();
             return true;
         } catch (Exception e) {
@@ -298,7 +327,8 @@ public class TlsConfigSource implements ConfigSource {
     }
 
     /**
-     * Extracts custom hostnames from FLOCI_HOSTNAME and FLOCI_BASE_URL configuration.
+     * Extracts custom hostnames from FLOCI_HOSTNAME, FLOCI_BASE_URL and
+     * FLOCI_SERVICES_IOT_ENDPOINT_ADDRESS configuration.
      * Filters out default values like "localhost" and "127.0.0.1".
      * Returns a deduplicated list of custom hostnames.
      *
@@ -325,6 +355,26 @@ public class TlsConfigSource implements ConfigSource {
             }
         } catch (URISyntaxException e) {
             LOG.warnv("TLS: failed to parse base URL for hostname extraction: {0}", baseUrl);
+        }
+
+        // Extract from FLOCI_SERVICES_IOT_ENDPOINT_ADDRESS: devices verify that name on 8883 and 443
+        String iotEndpoint = resolveProperty("floci.services.iot.endpoint-address", "").strip();
+        if (!iotEndpoint.isEmpty()) {
+            try {
+                // Anything beyond host[:port] is a typo: java.net.URI would read "https" as the host of a URL.
+                URI uri = new URI("//" + iotEndpoint);
+                String host = uri.getHost();
+                if (host == null || uri.getUserInfo() != null || !iotEndpoint.equals(uri.getRawAuthority())) {
+                    LOG.warnv("TLS: floci.services.iot.endpoint-address is not a host or host:port, not added to the certificate: {0}",
+                            iotEndpoint);
+                } else if (!isDefaultHostname(host)) {
+                    hostnames.add(host);
+                    LOG.debugv("TLS: extracted hostname from floci.services.iot.endpoint-address: {0}", host);
+                }
+            } catch (URISyntaxException e) {
+                LOG.warnv("TLS: failed to parse floci.services.iot.endpoint-address for hostname extraction: {0}",
+                        iotEndpoint);
+            }
         }
 
         List<String> result = new ArrayList<>(hostnames);

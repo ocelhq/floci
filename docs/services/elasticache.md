@@ -16,13 +16,13 @@ Floci manages real Valkey/Redis Docker containers and proxies TCP connections to
 | `DescribeReplicationGroups` | List clusters and their connection info |
 | `ModifyReplicationGroup` | Modify `SnapshotRetentionLimit` and `SnapshotWindow`, and the associated user groups |
 | `DeleteReplicationGroup` | Stop and remove a cluster |
-| `CreateUser` | Create an ElastiCache IAM user |
+| `CreateUser` | Create a user with password, no-password-required or IAM authentication, set through `AuthenticationMode` or the top-level `Passwords` and `NoPasswordRequired` |
 | `DescribeUsers` | List ElastiCache users |
-| `ModifyUser` | Update user access strings |
+| `ModifyUser` | Change a user's passwords and authentication mode, replace its access string with `AccessString` or add to it with `AppendAccessString` |
 | `DeleteUser` | Remove an ElastiCache user |
-| `CreateCacheCluster` | - |
-| `DescribeCacheClusters` | - |
-| `DeleteCacheCluster` | - |
+| `CreateCacheCluster` | Start a Memcached cluster, or a single-node Redis/Valkey one (`NumCacheNodes` must be 1) |
+| `DescribeCacheClusters` | List cache clusters: Memcached, single-node Redis/Valkey, and replication group members |
+| `DeleteCacheCluster` | Stop and remove a cache cluster |
 | `CreateCacheSubnetGroup` | Create a cache subnet group |
 | `DescribeCacheSubnetGroups` | List cache subnet groups |
 | `ModifyCacheSubnetGroup` | Replace a group's description or subnets |
@@ -34,6 +34,78 @@ Floci manages real Valkey/Redis Docker containers and proxies TCP connections to
 | `DeleteCacheParameterGroup` | Delete a cache parameter group |
 | `ListTagsForResource` | Tags on a parameter group ARN |
 <!-- floci:actions:end -->
+
+### Single-node Redis/Valkey clusters
+
+`CreateCacheCluster` serves three engines. `Engine=memcached` starts a Memcached container and
+reports its node-discovery `ConfigurationEndpoint`. `Engine=redis` or `Engine=valkey` starts a
+single-node cluster with no replication group: the same Valkey container and auth proxy a
+cluster-mode-disabled replication group gets, on a port from the same proxy range, which defaults
+to 6379. AWS allows only one node in that shape, so `NumCacheNodes` greater than 1 is refused with
+`InvalidParameterValue`, as it is on a live account.
+
+This is the call `aws_elasticache_cluster` with `engine = "redis"` emits, which is why it is not
+interchangeable with `CreateReplicationGroup`: a single-node cluster created this way never appears
+in `DescribeReplicationGroups`. Following AWS, it carries no `ConfigurationEndpoint` either, and
+reports its node's address under `CacheNodes` when the request sets `ShowCacheNodeInfo`. These
+clusters are re-provisioned after a Floci restart, the same as replication groups and Memcached
+clusters.
+
+An id is taken across all three at once: a standalone cache cluster, a Memcached cluster and a
+replication group cannot share one. Two of them would have `DescribeCacheClusters` report the same
+id twice, and for a cache cluster against a replication group it is worse, since Floci names both
+their containers `valkey-<id>` and keys both their proxies by it. Whichever create arrives second
+is refused, whether it is `CreateCacheCluster` or `CreateReplicationGroup`, rather than allowed to
+remove the first's container.
+
+`CacheSubnetGroupName` must name a subnet group that exists, as on AWS, on the `Engine=redis` and
+`Engine=valkey` paths. `Engine=memcached` drops the parameter: it is neither checked nor echoed
+back. (`CreateReplicationGroup` does not check it either, so a replication group can still be
+created against a name nothing resolves.)
+
+Each record re-reserves its proxy port as it is restored, before Floci serves anything, so a
+create is never handed a port a surviving cluster or replication group still advertises.
+
+#### Port, when two caches ask for the same one
+
+On AWS, `Port` belongs to a cache's own endpoint. 6379 is the Redis default, so nearly every
+ElastiCache cluster uses it and they coexist: each cache gets a DNS name of its own, and the
+port never has to tell them apart. Floci puts every cache's proxy on one host, where a TCP port
+is exclusive and the port is the only thing that does tell them apart.
+
+This section is about `Engine=redis` and `Engine=valkey`, the engines Floci fronts with an auth
+proxy. `Engine=memcached` never reaches any of it: `CreateCacheCluster` routes that engine to a
+path the `Port` is not passed to, so a pinned port is silently ignored and the cluster reports
+the Docker-published port it is actually on. The safety property below holds there for a
+different reason, not because the rules do.
+
+So a `Port` you pass is honored when it is free and inside
+`FLOCI_SERVICES_ELASTICACHE_PROXY_BASE_PORT`/`_MAX_PORT`, and otherwise the cache is served on
+another port from that range, which is the port its endpoint then reports. A create is never
+refused for a port that is merely taken: refusing the second cache on 6379 breaks any module
+standing up two Redis clusters, and any suite running one per test in parallel.
+
+**The port a cache reports is always the port it is actually on.** If you pinned one Floci could
+not give you, the endpoint reports the substitute rather than the port you asked for, and the
+create logs a warning saying which and why. That is a visible difference: terraform treats the
+port as replacement-forcing, so a pinned port that was unavailable shows up as a diff on the
+next plan. It is deliberately preferred to the alternative, where a cache reports the port you
+pinned while listening somewhere else, because that endpoint names a *different* cache's
+listener and a client following it reads the wrong cache's data with no error.
+
+The only port rejection left is a range check: `Port` must be between 1150 and 65535. That bound
+is the one `RdsService.reserveProxyPort` applies to the same argument, not a measurement of
+ElastiCache's own limit, which nothing here establishes. It is strictly more permissive than the
+proxy-range check it replaced, so the direction it could be wrong in is accepting a port AWS
+would refuse, never refusing one AWS accepts.
+
+`SnapshotRetentionLimit`, `SnapshotWindow`, `PreferredMaintenanceWindow`,
+`PreferredAvailabilityZone`, `SecurityGroupIds`, `NetworkType`, `IpDiscovery` and
+`AtRestEncryptionEnabled` (output-only on real AWS's CreateCacheCluster; accepted here leniently and echoed) are kept and echoed by `DescribeCacheClusters`, with the same defaults
+and the same validation the replication group applies, since every one is an optional
+`aws_elasticache_cluster` argument that would otherwise read back unset and leave a permanent
+plan diff. `NotificationConfiguration` and `LogDeliveryConfigurations` are **not** modelled: a
+request may send them, and the describe will not report them back.
 
 ### Cluster Mode
 
@@ -60,14 +132,34 @@ case — the shipped `docker-compose.yml` uses `localhost.floci.io`, which publi
 Floci's embedded DNS resolve it to the Floci container from inside Docker. Cluster-mode groups
 then announce that name and report it as their `ConfigurationEndpoint`.
 
-With `persistent`, `hybrid` or `wal` storage, cluster-mode groups are re-provisioned from their
-persisted topology on startup: containers are restarted, the cluster is re-formed (caches restart
-empty, as on any Floci restart) and each node's proxy port is re-reserved. Ports are re-reserved
-and groups marked `creating` before Floci reports ready; the container restarts and cluster
-formation run in the background so a slow Docker daemon cannot delay readiness, and each group
-flips to `available` once its data plane is back. A group whose data plane cannot be brought back
-is reported with status `create-failed` instead of `available`, and its member clusters answer
-`DescribeCacheClusters` with `restore-failed` (`CacheClusterStatus` has no `create-failed` value).
+With `persistent`, `hybrid` or `wal` storage, every replication group, standalone cache cluster
+and Memcached cluster is re-provisioned from its persisted record on startup: containers are restarted, cluster-mode groups
+are re-formed, and proxy ports are re-reserved. Caches restart empty, as on any Floci restart:
+only the topology is persisted, never the keyspace.
+
+Ports are re-reserved and records marked `creating` before Floci reports ready; the container
+restarts and cluster formation run in the background so a slow Docker daemon cannot delay
+readiness, and each record flips to `available` once its data plane is back. A replication group
+whose data plane cannot be brought back is reported with status `create-failed` instead of
+`available`, and its member clusters answer `DescribeCacheClusters` with `restore-failed`
+(`CacheClusterStatus` has no `create-failed` value). A standalone cache cluster or Memcached
+cluster that cannot be brought back reports `restore-failed` directly.
+
+Reporting a failed record as failed matters more than it looks. A record that is left unreconciled
+keeps its `available` status with nothing behind the endpoint, so the control plane answers healthy
+while every connection fails, and the proxy port it still advertises is free for the next create to
+take: the old endpoint then reaches an unrelated cache rather than failing cleanly.
+
+A Memcached cluster's endpoint follows its new container. Outside Docker, Floci publishes the
+backend on a host port Docker picks per run, so a restored cluster's `ConfigurationEndpoint` port
+can differ from the one it had before the restart. Replication groups and standalone cache
+clusters keep their port: it is a proxy port Floci owns and re-reserves.
+
+A delete that arrives while a record is still `creating` wins. The restore takes the same
+per-record monitor `DeleteReplicationGroup` and `DeleteCacheCluster` take, and skips its write-back
+when the record is gone, so a group or cluster deleted in the first seconds after boot stays
+deleted rather than coming back `available`. Any container the abandoned restore had already
+started is stopped.
 
 `DescribeReplicationGroups` reports the topology honestly: `ClusterEnabled`, one `NodeGroup` per
 shard with its `Slots`, `NodeGroupMembers`, and `MemberClusters`. Each member also answers

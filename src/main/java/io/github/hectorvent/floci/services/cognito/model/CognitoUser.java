@@ -16,6 +16,7 @@ public class CognitoUser {
     private String userStatus; // UNCONFIRMED, CONFIRMED, ARCHIVED, COMPROMISED, UNKNOWN, RESET_REQUIRED, FORCE_CHANGE_PASSWORD
     private boolean enabled;
     private Map<String, String> attributes = new HashMap<>();
+    private Map<String, String> pendingAttributes = new HashMap<>();
     private long creationDate;
     private long lastModifiedDate;
     private String passwordHash;
@@ -25,6 +26,11 @@ public class CognitoUser {
     private String srpSalt;
     private String srpVerifier;
     private EmailMfaSettings emailMfaSettings;
+    private String softwareTokenMfaSecret;
+    private String pendingSoftwareTokenMfaSecret;
+    private Integer pendingSoftwareTokenMfaAttemptsRemaining;
+    private String federatedProviderName;
+    private String federatedSubject;
 
     public CognitoUser() {
         long now = System.currentTimeMillis() / 1000L;
@@ -48,6 +54,13 @@ public class CognitoUser {
 
     public Map<String, String> getAttributes() { return attributes; }
     public void setAttributes(Map<String, String> attributes) { this.attributes = attributes; }
+
+    public Map<String, String> getPendingAttributes() { return pendingAttributes; }
+    public void setPendingAttributes(Map<String, String> pendingAttributes) {
+        this.pendingAttributes = pendingAttributes == null
+                ? new HashMap<>()
+                : new HashMap<>(pendingAttributes);
+    }
 
     public long getCreationDate() { return creationDate; }
     public void setCreationDate(long creationDate) { this.creationDate = creationDate; }
@@ -80,5 +93,32 @@ public class CognitoUser {
 
     public void setEmailMfaSettings(EmailMfaSettings emailMfaSettings) {
         this.emailMfaSettings = emailMfaSettings;
+    }
+
+    public String getSoftwareTokenMfaSecret() { return softwareTokenMfaSecret; }
+    public void setSoftwareTokenMfaSecret(String secret) { this.softwareTokenMfaSecret = secret; }
+
+    public String getPendingSoftwareTokenMfaSecret() { return pendingSoftwareTokenMfaSecret; }
+    public void setPendingSoftwareTokenMfaSecret(String secret) { this.pendingSoftwareTokenMfaSecret = secret; }
+
+    public Integer getPendingSoftwareTokenMfaAttemptsRemaining() { return pendingSoftwareTokenMfaAttemptsRemaining; }
+    public void setPendingSoftwareTokenMfaAttemptsRemaining(Integer attempts) {
+        this.pendingSoftwareTokenMfaAttemptsRemaining = attempts;
+    }
+
+    public String getFederatedProviderName() {
+        return federatedProviderName;
+    }
+
+    public void setFederatedProviderName(String federatedProviderName) {
+        this.federatedProviderName = federatedProviderName;
+    }
+
+    public String getFederatedSubject() {
+        return federatedSubject;
+    }
+
+    public void setFederatedSubject(String federatedSubject) {
+        this.federatedSubject = federatedSubject;
     }
 }

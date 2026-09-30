@@ -4,7 +4,9 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.AwsRegionFacts;
 import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.common.SsrfProtection;
 import io.github.hectorvent.floci.core.common.dns.EmbeddedDnsServer;
 import io.github.hectorvent.floci.core.storage.StorageBackedMap;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
@@ -15,6 +17,8 @@ import jakarta.annotation.PostConstruct;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 
+import java.io.IOException;
+import java.net.InetAddress;
 import java.time.Instant;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
@@ -47,8 +51,6 @@ public class ElbV2Service implements ResourceProvider {
 
     @Inject
     EmulatorConfig config;
-
-    private static final String CANONICAL_HOSTED_ZONE_ID = "Z35SXDOTRQ7X7K";
 
     // region → ARN → resource
     private Map<String, Map<String, LoadBalancer>> loadBalancers = new ConcurrentHashMap<>();
@@ -101,6 +103,18 @@ public class ElbV2Service implements ResourceProvider {
         }
     }
 
+    /**
+     * Drops one entry from an ARN index. The list has to be looked up rather than defaulted:
+     * {@code getOrDefault(key, List.of())} hands back an immutable list whose {@code remove}
+     * throws, which the Query path reports as an {@code InternalFailure}.
+     */
+    private static void removeFromIndex(Map<String, List<String>> index, String key, String value) {
+        List<String> entries = index.get(key);
+        if (entries != null) {
+            entries.remove(value);
+        }
+    }
+
     private <V> void persistRegion(Map<String, Map<String, V>> resources, String region) {
         Map<String, V> regionResources = resources.get(region);
         if (regionResources != null) {
@@ -148,6 +162,7 @@ public class ElbV2Service implements ResourceProvider {
      */
     public void restorePersistedRuntime()
     {
+        refreshCanonicalHostedZones();
         if (healthChecker != null) {
             for (Map<String, TargetGroup> regionTargetGroups : targetGroups.values()) {
                 for (TargetGroup targetGroup : regionTargetGroups.values()) {
@@ -195,7 +210,7 @@ public class ElbV2Service implements ResourceProvider {
         LoadBalancer lb = new LoadBalancer();
         lb.setLoadBalancerArn(arn);
         lb.setDnsName(dnsName);
-        lb.setCanonicalHostedZoneId(CANONICAL_HOSTED_ZONE_ID);
+        lb.setCanonicalHostedZoneId(canonicalHostedZoneId(lbType, region));
         lb.setCreatedTime(Instant.now());
         lb.setLoadBalancerName(name);
         lb.setScheme(lbScheme);
@@ -248,16 +263,19 @@ public class ElbV2Service implements ResourceProvider {
     }
 
     public void deleteLoadBalancer(String region, String arn) {
-        Map<String, LoadBalancer> regionLbs = loadBalancers.getOrDefault(region, Map.of());
+        Map<String, LoadBalancer> regionLbs = loadBalancers.get(region);
+        if (regionLbs == null) {
+            return; // AWS silently ignores non-existent LBs on delete
+        }
         LoadBalancer lb = regionLbs.remove(arn);
         if (lb == null) {
-            return; // AWS silently ignores non-existent LBs on delete
+            return;
         }
         // cascade: listeners → rules
         List<String> listenerArns = lbToListeners.remove(arn);
         if (listenerArns != null) {
-            Map<String, Listener> regionListeners = listeners.getOrDefault(region, Map.of());
-            Map<String, Rule> regionRules = rules.getOrDefault(region, Map.of());
+            Map<String, Listener> regionListeners = listeners.computeIfAbsent(region, k -> new ConcurrentHashMap<>());
+            Map<String, Rule> regionRules = rules.computeIfAbsent(region, k -> new ConcurrentHashMap<>());
             for (String listenerArn : listenerArns) {
                 dataPlane.stopListener(listenerArn);
                 regionListeners.remove(listenerArn);
@@ -339,6 +357,7 @@ public class ElbV2Service implements ResourceProvider {
                                           String matcher, String ipAddressType,
                                           Map<String, String> initialTags) {
         validateName(name, "target group");
+        validateHealthCheckPort(healthCheckPort);
         Map<String, TargetGroup> regionTgs = targetGroups.computeIfAbsent(region, k -> new ConcurrentHashMap<>());
         boolean duplicate = regionTgs.values().stream()
                 .anyMatch(tg -> tg.getTargetGroupName().equals(name));
@@ -432,6 +451,7 @@ public class ElbV2Service implements ResourceProvider {
                                    Integer healthCheckTimeout, Integer healthyThreshold,
                                    Integer unhealthyThreshold, String matcher) {
         TargetGroup tg = requireTargetGroup(region, arn);
+        validateHealthCheckPort(healthCheckPort);
         if (healthCheckProtocol != null) tg.setHealthCheckProtocol(healthCheckProtocol);
         if (healthCheckPort != null)     tg.setHealthCheckPort(healthCheckPort);
         if (healthCheckEnabled != null)  tg.setHealthCheckEnabled(healthCheckEnabled);
@@ -540,15 +560,18 @@ public class ElbV2Service implements ResourceProvider {
     }
 
     public void deleteListener(String region, String listenerArn) {
-        Map<String, Listener> regionListeners = listeners.getOrDefault(region, Map.of());
+        Map<String, Listener> regionListeners = listeners.get(region);
+        if (regionListeners == null) {
+            return;
+        }
         Listener listener = regionListeners.remove(listenerArn);
         if (listener == null) {
             return;
         }
         dataPlane.stopListener(listenerArn);
-        lbToListeners.getOrDefault(listener.getLoadBalancerArn(), List.of()).remove(listenerArn);
+        removeFromIndex(lbToListeners, listener.getLoadBalancerArn(), listenerArn);
 
-        Map<String, Rule> regionRules = rules.getOrDefault(region, Map.of());
+        Map<String, Rule> regionRules = rules.computeIfAbsent(region, k -> new ConcurrentHashMap<>());
         List<String> ruleArns = listenerToRules.remove(listenerArn);
         if (ruleArns != null) {
             ruleArns.forEach(regionRules::remove);
@@ -692,7 +715,7 @@ public class ElbV2Service implements ResourceProvider {
         String listenerArn = rule.getListenerArn();
         regionRules.remove(ruleArn);
         rules.put(region, regionRules);
-        listenerToRules.getOrDefault(listenerArn, List.of()).remove(ruleArn);
+        removeFromIndex(listenerToRules, listenerArn, ruleArn);
         tags.remove(ruleArn);
         Listener listener = listeners.getOrDefault(region, Map.of()).get(listenerArn);
         if (listener != null) {
@@ -729,18 +752,28 @@ public class ElbV2Service implements ResourceProvider {
             }
         }
 
-        // check for collisions with rules NOT in the update set
-        Set<String> updatingArns = arnToPriority.keySet();
-        Set<Integer> newPriorities = new HashSet<>(arnToPriority.values());
+        // priorities are unique per listener, so collisions are only checked among rules of the same listener
+        Map<String, Set<Integer>> newPrioritiesByListener = new HashMap<>();
+        for (Map.Entry<String, Integer> e : arnToPriority.entrySet()) {
+            String listenerArn = regionRules.get(e.getKey()).getListenerArn();
+            if (!newPrioritiesByListener.computeIfAbsent(listenerArn, k -> new HashSet<>()).add(e.getValue())) {
+                throw new AwsException("PriorityInUse",
+                        "Priority " + e.getValue() + " is already in use.", 400);
+            }
+        }
+        // iterate the concurrent region map, not the listener index lists, which CreateRule/DeleteRule mutate
         for (Rule existing : regionRules.values()) {
-            if (!updatingArns.contains(existing.getRuleArn()) && !existing.isDefault()) {
-                try {
-                    int existingPriority = Integer.parseInt(existing.getPriority());
-                    if (newPriorities.contains(existingPriority)) {
-                        throw new AwsException("PriorityInUse",
-                                "Priority " + existingPriority + " is already in use.", 400);
-                    }
-                } catch (NumberFormatException ignored) { /* default rule */ }
+            if (existing.isDefault() || arnToPriority.containsKey(existing.getRuleArn())) {
+                continue;
+            }
+            Set<Integer> newPriorities = newPrioritiesByListener.get(existing.getListenerArn());
+            if (newPriorities == null) {
+                continue;
+            }
+            int existingPriority = Integer.parseInt(existing.getPriority());
+            if (newPriorities.contains(existingPriority)) {
+                throw new AwsException("PriorityInUse",
+                        "Priority " + existingPriority + " is already in use.", 400);
             }
         }
 
@@ -758,6 +791,11 @@ public class ElbV2Service implements ResourceProvider {
 
     public void registerTargets(String region, String tgArn, List<TargetDescription> targets) {
         TargetGroup tg = requireTargetGroup(region, tgArn);
+        if (!"lambda".equals(tg.getTargetType())) {
+            for (TargetDescription t : targets) {
+                requireNotMetadataAddress(t.getId());
+            }
+        }
         List<TargetDescription> existing = tg.getTargets();
         for (TargetDescription t : targets) {
             // replace if same id+port already registered
@@ -766,6 +804,18 @@ public class ElbV2Service implements ResourceProvider {
         }
         persistRegion(targetGroups, region);
         healthChecker.addTargets(tgArn, targets, tg);
+    }
+
+    private static void requireNotMetadataAddress(String targetId) {
+        if (!ElbV2TargetResolver.isIpLiteral(targetId)) {
+            return;
+        }
+        try {
+            SsrfProtection.rejectMetadataAddresses(InetAddress.getAllByName(targetId), targetId);
+        } catch (IOException e) {
+            throw new AwsException("InvalidTarget",
+                    "The IP address '" + targetId + "' is not a valid target", 400);
+        }
     }
 
     public void deregisterTargets(String region, String tgArn, List<TargetDescription> targets) {
@@ -1018,6 +1068,17 @@ public class ElbV2Service implements ResourceProvider {
                 .collect(Collectors.toList());
     }
 
+    /** {@code HealthCheckPort} is either {@code traffic-port} or a port number from 1 to 65535. */
+    private static void validateHealthCheckPort(String healthCheckPort) {
+        if (healthCheckPort == null || "traffic-port".equals(healthCheckPort)) {
+            return;
+        }
+        if (ElbV2HealthChecker.parsePort(healthCheckPort) == null) {
+            throw new AwsException("ValidationError",
+                    "Health check port '" + healthCheckPort + "' must be 'traffic-port' or a port number from 1 to 65535.", 400);
+        }
+    }
+
     private static void validateName(String name, String resource) {
         if (name == null || name.isEmpty()) {
             throw new AwsException("ValidationError", "Name is required for " + resource + ".", 400);
@@ -1038,6 +1099,37 @@ public class ElbV2Service implements ResourceProvider {
 
     private static String randomHex16() {
         return UUID.randomUUID().toString().replace("-", "").substring(0, 16);
+    }
+
+    /**
+     * A load balancer stored before the hosted zones were looked up per region and type still
+     * carries the one fixed zone every balancer used to report, so restored balancers take the
+     * zone of their region and type again, written back so the stored copy agrees.
+     */
+    private void refreshCanonicalHostedZones() {
+        for (String region : List.copyOf(loadBalancers.keySet())) {
+            Map<String, LoadBalancer> regionLoadBalancers = loadBalancers.get(region);
+            if (regionLoadBalancers == null) {
+                continue;
+            }
+            for (LoadBalancer lb : regionLoadBalancers.values()) {
+                String lbType = lb.getType() != null ? lb.getType() : "application";
+                lb.setCanonicalHostedZoneId(canonicalHostedZoneId(lbType, region));
+            }
+            loadBalancers.put(region, regionLoadBalancers);
+        }
+    }
+
+    /**
+     * Network load balancers have their own hosted zone per region, distinct from the one
+     * Application (and Classic) load balancers share; a gateway load balancer has none.
+     */
+    private static String canonicalHostedZoneId(String type, String region) {
+        return switch (type) {
+            case "network" -> AwsRegionFacts.nlbHostedZoneId(region).orElse(null);
+            case "gateway" -> null;
+            default -> AwsRegionFacts.albHostedZoneId(region).orElse(null);
+        };
     }
 
     private static String lbTypePrefix(String type) {

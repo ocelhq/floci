@@ -2,20 +2,39 @@ package io.github.hectorvent.floci.config;
 
 import io.github.hectorvent.floci.services.acm.CertificateGenerator;
 import io.github.hectorvent.floci.services.acm.model.KeyAlgorithm;
+import org.bouncycastle.asn1.x500.X500Name;
+import org.bouncycastle.asn1.x509.BasicConstraints;
+import org.bouncycastle.asn1.x509.Extension;
+import org.bouncycastle.asn1.x509.KeyUsage;
+import org.bouncycastle.cert.jcajce.JcaX509CertificateConverter;
+import org.bouncycastle.cert.jcajce.JcaX509v3CertificateBuilder;
+import org.bouncycastle.openssl.jcajce.JcaPEMWriter;
+import org.bouncycastle.operator.jcajce.JcaContentSignerBuilder;
+import org.bouncycastle.pkcs.jcajce.JcaPKCS10CertificationRequestBuilder;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.io.StringWriter;
+import java.math.BigInteger;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.attribute.PosixFilePermission;
 import java.nio.file.attribute.PosixFilePermissions;
+import java.security.KeyPair;
+import java.security.KeyPairGenerator;
 import java.security.cert.X509Certificate;
+import java.time.Instant;
+import java.time.temporal.ChronoUnit;
+import java.util.Date;
 import java.util.List;
 import java.util.Set;
+import javax.security.auth.x500.X500Principal;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class FlociCertificateAuthorityTest {
@@ -69,6 +88,37 @@ class FlociCertificateAuthorityTest {
     }
 
     @Test
+    void upgradesLegacyCaWithoutChangingItsKeyOrExpiry() throws Exception {
+        CertificateGenerator generator = new CertificateGenerator();
+        KeyPair keyPair = rsaKeyPair(2048);
+        X500Name dn = new X500Name("CN=" + FlociCertificateAuthority.COMMON_NAME);
+        Instant notBefore = Instant.now().minus(1, ChronoUnit.DAYS);
+        Instant notAfter = Instant.now().plus(365, ChronoUnit.DAYS);
+        JcaX509v3CertificateBuilder builder = new JcaX509v3CertificateBuilder(dn, BigInteger.ONE,
+                Date.from(notBefore), Date.from(notAfter), dn, keyPair.getPublic());
+        builder.addExtension(Extension.basicConstraints, true, new BasicConstraints(true));
+        builder.addExtension(Extension.keyUsage, true,
+                new KeyUsage(KeyUsage.digitalSignature | KeyUsage.keyCertSign | KeyUsage.cRLSign));
+        X509Certificate legacy = new JcaX509CertificateConverter().getCertificate(
+                builder.build(new JcaContentSignerBuilder("SHA512WithRSA").build(keyPair.getPrivate())));
+        assertNull(legacy.getExtensionValue(Extension.subjectKeyIdentifier.getId()));
+        Files.writeString(tempDir.resolve(FlociCertificateAuthority.CA_CERT_NAME), generator.toPem(legacy));
+        String privateKeyPem = generator.toPem(keyPair.getPrivate());
+        Files.writeString(tempDir.resolve(FlociCertificateAuthority.CA_KEY_NAME), privateKeyPem);
+
+        FlociCertificateAuthority upgraded = FlociCertificateAuthority.loadOrCreate(tempDir);
+
+        assertEquals(legacy.getPublicKey(), upgraded.certificate().getPublicKey());
+        assertEquals(legacy.getNotAfter(), upgraded.certificate().getNotAfter());
+        assertEquals(privateKeyPem, Files.readString(tempDir.resolve(FlociCertificateAuthority.CA_KEY_NAME)));
+        assertTrue(upgraded.certificate().getExtensionValue(Extension.subjectKeyIdentifier.getId()) != null);
+        assertTrue(upgraded.certificate().getExtensionValue(Extension.authorityKeyIdentifier.getId()) != null);
+        assertNotEquals(legacy, upgraded.certificate());
+        assertEquals(upgraded.fingerprint(), FlociCertificateAuthority.loadOrCreate(tempDir).fingerprint(),
+                "migration must happen only once");
+    }
+
+    @Test
     void corruptCaIsRegeneratedNotSilentlyKept() throws Exception {
         FlociCertificateAuthority first = FlociCertificateAuthority.loadOrCreate(tempDir);
         Files.writeString(tempDir.resolve("floci-root-ca.crt"), "-----BEGIN CERTIFICATE-----\nnope\n-----END CERTIFICATE-----\n");
@@ -95,8 +145,8 @@ class FlociCertificateAuthorityTest {
     @Test
     void expiredCaIsRegenerated() throws Exception {
         CertificateGenerator gen = new CertificateGenerator();
-        java.security.KeyPair keyPair = java.security.KeyPairGenerator.getInstance("RSA").generateKeyPair();
-        var dn = new org.bouncycastle.asn1.x500.X500Name("CN=" + FlociCertificateAuthority.COMMON_NAME);
+        KeyPair keyPair = KeyPairGenerator.getInstance("RSA").generateKeyPair();
+        X500Name dn = new X500Name("CN=" + FlociCertificateAuthority.COMMON_NAME);
         X509Certificate expired = gen.signCertificate(dn, keyPair.getPublic(), dn, keyPair.getPrivate(), List.of(),
                 true, null, -1);
         Files.writeString(tempDir.resolve("floci-root-ca.crt"), gen.toPem(expired));
@@ -159,6 +209,8 @@ class FlociCertificateAuthorityTest {
         cert.verify(ca.certificate().getPublicKey());
         assertEquals("CN=AWS IoT Certificate", cert.getSubjectX500Principal().getName());
         assertEquals(List.of("1.3.6.1.5.5.7.3.2"), cert.getExtendedKeyUsage());
+        assertTrue(cert.getExtensionValue(Extension.subjectKeyIdentifier.getId()) != null);
+        assertTrue(cert.getExtensionValue(Extension.authorityKeyIdentifier.getId()) != null);
         assertTrue(ca.isIssuedByUs(cert));
         assertEquals(java.time.Instant.parse("2049-12-31T23:59:59Z"), cert.getNotAfter().toInstant(), "AWS's fixed expiry");
         assertEquals(java.time.Instant.parse("2050-12-31T23:59:59Z"), ca.certificate().getNotAfter().toInstant(),
@@ -231,10 +283,12 @@ class FlociCertificateAuthorityTest {
 
         cert.verify(ca.certificate().getPublicKey());
         assertEquals(deviceKey.getPublic(), cert.getPublicKey());
-        assertEquals(new javax.security.auth.x500.X500Principal(
-                new org.bouncycastle.asn1.x500.X500Name("CN=device-42,O=Example").getEncoded()), cert.getSubjectX500Principal());
+        assertEquals(new X500Principal(
+                new X500Name("CN=device-42,O=Example").getEncoded()), cert.getSubjectX500Principal());
         assertEquals(List.of("1.3.6.1.5.5.7.3.2"), cert.getExtendedKeyUsage());
         assertEquals(-1, cert.getBasicConstraints());
+        assertTrue(cert.getExtensionValue(Extension.subjectKeyIdentifier.getId()) != null);
+        assertTrue(cert.getExtensionValue(Extension.authorityKeyIdentifier.getId()) != null);
         assertTrue(ca.isIssuedByUs(cert));
     }
 
@@ -242,10 +296,10 @@ class FlociCertificateAuthorityTest {
     void refusesWhatIsNotACsr() throws Exception {
         FlociCertificateAuthority ca = FlociCertificateAuthority.loadOrCreate(tempDir);
 
-        var notPem = org.junit.jupiter.api.Assertions.assertThrows(IllegalArgumentException.class,
+        IllegalArgumentException notPem = assertThrows(IllegalArgumentException.class,
                 () -> ca.signClientCsr("hello"));
         assertTrue(notPem.getMessage().contains("certificateSigningRequest"), notPem.getMessage());
-        var certificate = org.junit.jupiter.api.Assertions.assertThrows(IllegalArgumentException.class,
+        IllegalArgumentException certificate = assertThrows(IllegalArgumentException.class,
                 () -> ca.signClientCsr(ca.caPem()));
         assertTrue(certificate.getMessage().contains("not a PEM CERTIFICATE REQUEST"), certificate.getMessage());
     }
@@ -255,23 +309,23 @@ class FlociCertificateAuthorityTest {
         FlociCertificateAuthority ca = FlociCertificateAuthority.loadOrCreate(tempDir);
         String weak = csrPem("CN=weak", rsaKeyPair(1024));
 
-        var refused = org.junit.jupiter.api.Assertions.assertThrows(IllegalArgumentException.class,
+        IllegalArgumentException refused = assertThrows(IllegalArgumentException.class,
                 () -> ca.signClientCsr(weak));
         assertTrue(refused.getMessage().contains("2048"), refused.getMessage());
     }
 
-    private static java.security.KeyPair rsaKeyPair(int bits) throws Exception {
-        java.security.KeyPairGenerator kpg = java.security.KeyPairGenerator.getInstance("RSA");
+    private static KeyPair rsaKeyPair(int bits) throws Exception {
+        KeyPairGenerator kpg = KeyPairGenerator.getInstance("RSA");
         kpg.initialize(bits);
         return kpg.generateKeyPair();
     }
 
-    private static String csrPem(String subject, java.security.KeyPair keyPair) throws Exception {
-        var csr = new org.bouncycastle.pkcs.jcajce.JcaPKCS10CertificationRequestBuilder(
-                new org.bouncycastle.asn1.x500.X500Name(subject), keyPair.getPublic())
-                .build(new org.bouncycastle.operator.jcajce.JcaContentSignerBuilder("SHA256withRSA").build(keyPair.getPrivate()));
-        java.io.StringWriter out = new java.io.StringWriter();
-        try (var writer = new org.bouncycastle.openssl.jcajce.JcaPEMWriter(out)) {
+    private static String csrPem(String subject, KeyPair keyPair) throws Exception {
+        var csr = new JcaPKCS10CertificationRequestBuilder(
+                new X500Name(subject), keyPair.getPublic())
+                .build(new JcaContentSignerBuilder("SHA256withRSA").build(keyPair.getPrivate()));
+        StringWriter out = new StringWriter();
+        try (var writer = new JcaPEMWriter(out)) {
             writer.writeObject(csr);
         }
         return out.toString();

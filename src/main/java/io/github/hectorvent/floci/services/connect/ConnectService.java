@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.common.ServicePrincipals;
 import io.github.hectorvent.floci.core.common.TagHandler;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
@@ -130,8 +131,9 @@ public class ConnectService implements TagHandler {
         instance.setInstanceAlias(instanceAlias);
         instance.setDirectoryId(directoryId);
         instance.setCreatedTime(Instant.now());
-        instance.setServiceRole("arn:aws:iam::" + regionResolver.getAccountId()
-                + ":role/aws-service-role/connect.amazonaws.com/AWSServiceRoleForAmazonConnect_" + instanceId);
+        instance.setServiceRole(regionResolver.buildGlobalArn("iam",
+                "role/aws-service-role/" + ServicePrincipals.of("connect")
+                        + "/AWSServiceRoleForAmazonConnect_" + instanceId));
         instance.setInboundCallsEnabled(inboundCallsEnabled);
         instance.setOutboundCallsEnabled(outboundCallsEnabled);
         if (instanceAlias != null) {

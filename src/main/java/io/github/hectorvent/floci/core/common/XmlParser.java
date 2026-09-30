@@ -1,12 +1,17 @@
 package io.github.hectorvent.floci.core.common;
 
 import org.jboss.logging.Logger;
+import org.w3c.dom.Document;
 
+import javax.xml.XMLConstants;
+import javax.xml.parsers.DocumentBuilderFactory;
 import javax.xml.stream.XMLInputFactory;
 import javax.xml.stream.XMLStreamConstants;
 import javax.xml.stream.XMLStreamException;
 import javax.xml.stream.XMLStreamReader;
+import java.io.ByteArrayInputStream;
 import java.io.StringReader;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -36,6 +41,35 @@ public final class XmlParser {
     }
 
     private XmlParser() {}
+
+    /**
+     * A stream reader over {@code xml} using this class's hardened settings: namespace-aware,
+     * with DTDs and external entities disabled.
+     *
+     * <p>For callers whose parsing goes beyond the extraction helpers here, typically because
+     * they read attributes. Reaching for {@link XMLInputFactory} directly means restating the
+     * hardening, and a copy that forgets a property is an XXE hole that nothing would catch.
+     */
+    public static XMLStreamReader newStreamReader(String xml) throws XMLStreamException {
+        return FACTORY.createXMLStreamReader(new StringReader(xml));
+    }
+
+    /**
+     * Parses XML into a namespace-aware DOM document with external entities and
+     * DTD processing disabled. DOM is required by the JDK XML-DSig API.
+     */
+    public static Document parseDocument(String xml) throws Exception {
+        DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();
+        factory.setNamespaceAware(true);
+        factory.setFeature(XMLConstants.FEATURE_SECURE_PROCESSING, true);
+        factory.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true);
+        factory.setFeature("http://xml.org/sax/features/external-general-entities", false);
+        factory.setFeature("http://xml.org/sax/features/external-parameter-entities", false);
+        factory.setXIncludeAware(false);
+        factory.setExpandEntityReferences(false);
+        return factory.newDocumentBuilder().parse(
+                new ByteArrayInputStream(xml.getBytes(StandardCharsets.UTF_8)));
+    }
 
     /**
      * Reads the text content of the current element if it is a leaf (contains only text).
@@ -154,6 +188,75 @@ public final class XmlParser {
     }
 
     /**
+     * A key paired with an optional version id and an optional {@code If-Match} ETag, extracted from a
+     * {@code Delete} request's {@code <Object>} block.
+     */
+    public record KeyVersion(String key, String versionId, String eTag) {
+        public KeyVersion(String key, String versionId) {
+            this(key, versionId, null);
+        }
+    }
+
+    /**
+     * Extracts {@code (Key, VersionId, ETag)} entries from an S3 {@code DeleteObjects} request body,
+     * one entry per {@code <Object>} block.
+     *
+     * <p>Unlike {@link #extractAll(String, String)}, which flattens every {@code <Key>} across
+     * the whole document, this keeps each key paired with the {@code VersionId} from the same
+     * {@code <Object>} block. This is needed so a batch delete can target the exact version named,
+     * rather than discarding it and always falling back to "no version specified".
+     *
+     * <p>{@code <VersionId>} and {@code <ETag>} are optional per the {@code Delete} request schema; an
+     * {@code <Object>} block that omits one yields an entry with {@code null} in its place. The ETag is a
+     * conditional-delete precondition, checked like an {@code If-Match} header on DeleteObject.
+     *
+     * <pre>{@code
+     * List<XmlParser.KeyVersion> entries = XmlParser.extractDeleteObjectEntries(body);
+     * }</pre>
+     */
+    public static List<KeyVersion> extractDeleteObjectEntries(String xml) {
+        List<KeyVersion> result = new ArrayList<>();
+        if (xml == null || xml.isEmpty()) {
+            return result;
+        }
+        try {
+            XMLStreamReader r = FACTORY.createXMLStreamReader(new StringReader(xml));
+            boolean inObject = false;
+            String key = null;
+            String versionId = null;
+            String eTag = null;
+            while (r.hasNext()) {
+                int event = r.next();
+                if (event == XMLStreamConstants.START_ELEMENT) {
+                    String local = r.getLocalName();
+                    if ("Object".equals(local)) {
+                        inObject = true;
+                        key = null;
+                        versionId = null;
+                        eTag = null;
+                    } else if (inObject && "Key".equals(local)) {
+                        key = r.getElementText();
+                    } else if (inObject && "VersionId".equals(local)) {
+                        versionId = r.getElementText();
+                    } else if (inObject && "ETag".equals(local)) {
+                        eTag = r.getElementText();
+                    }
+                } else if (event == XMLStreamConstants.END_ELEMENT
+                        && inObject && "Object".equals(r.getLocalName())) {
+                    if (key != null) {
+                        result.add(new KeyVersion(key, versionId, eTag));
+                    }
+                    inObject = false;
+                }
+            }
+            r.close();
+        } catch (Exception e) {
+            LOG.debugv("Ignoring malformed XML during parse: {0}", e.getMessage());
+        }
+        return result;
+    }
+
+    /**
      * Extracts sibling key/value pairs from every {@code parentElement} block.
      *
      * <p>Example — parses {@code <Tag><Key>env</Key><Value>prod</Value></Tag>}:
@@ -207,13 +310,34 @@ public final class XmlParser {
      * tags inside a single {@code <QueueConfiguration>}).
      */
     public static List<Map<String, List<String>>> extractGroupsMulti(String xml, String parentElement) {
-        List<Map<String, List<String>>> result = new ArrayList<>();
+        return extractLeafGroups(xml, parentElement,
+                (group, name, text) -> group.computeIfAbsent(name, k -> new ArrayList<>()).add(text));
+    }
+
+    /**
+     * Extracts every group of elements nested inside a repeating {@code parentElement},
+     * returning each group as a {@code Map<localName, text>}.
+     *
+     * <p>Useful for notification-configuration blocks that contain multiple fields:
+     * <pre>{@code
+     * List<Map<String,String>> configs =
+     *         XmlParser.extractGroups(body, "QueueConfiguration");
+     * // configs.get(0).get("QueueArn") → "arn:aws:sqs:..."
+     * }</pre>
+     */
+    public static List<Map<String, String>> extractGroups(String xml, String parentElement) {
+        return extractLeafGroups(xml, parentElement, Map::put);
+    }
+
+    private static <T> List<Map<String, T>> extractLeafGroups(
+            String xml, String parentElement, LeafCollector<T> leafCollector) {
+        List<Map<String, T>> result = new ArrayList<>();
         if (xml == null || xml.isEmpty()) {
             return result;
         }
         try {
             XMLStreamReader r = FACTORY.createXMLStreamReader(new StringReader(xml));
-            Map<String, List<String>> current = null;
+            Map<String, T> current = null;
             int depth = 0;
             while (r.hasNext()) {
                 int event = r.next();
@@ -225,7 +349,7 @@ public final class XmlParser {
                     } else if (current != null && depth == 1) {
                         String text = readLeafText(r);
                         if (text != null) {
-                            current.computeIfAbsent(local, k -> new ArrayList<>()).add(text);
+                            leafCollector.add(current, local, text);
                         }
                     } else if (current != null) {
                         depth++;
@@ -247,56 +371,9 @@ public final class XmlParser {
         return result;
     }
 
-    /**
-     * Extracts every group of elements nested inside a repeating {@code parentElement},
-     * returning each group as a {@code Map<localName, text>}.
-     *
-     * <p>Useful for notification-configuration blocks that contain multiple fields:
-     * <pre>{@code
-     * List<Map<String,String>> configs =
-     *         XmlParser.extractGroups(body, "QueueConfiguration");
-     * // configs.get(0).get("QueueArn") → "arn:aws:sqs:..."
-     * }</pre>
-     */
-    public static List<Map<String, String>> extractGroups(String xml, String parentElement) {
-        List<Map<String, String>> result = new ArrayList<>();
-        if (xml == null || xml.isEmpty()) {
-            return result;
-        }
-        try {
-            XMLStreamReader r = FACTORY.createXMLStreamReader(new StringReader(xml));
-            Map<String, String> current = null;
-            int depth = 0;
-            while (r.hasNext()) {
-                int event = r.next();
-                if (event == XMLStreamConstants.START_ELEMENT) {
-                    String local = r.getLocalName();
-                    if (parentElement.equals(local)) {
-                        current = new LinkedHashMap<>();
-                        depth = 1;
-                    } else if (current != null && depth == 1) {
-                        String text = readLeafText(r);
-                        if (text != null) {
-                            current.put(local, text);
-                        }
-                    } else if (current != null) {
-                        depth++;
-                    }
-                } else if (event == XMLStreamConstants.END_ELEMENT) {
-                    if (current != null && parentElement.equals(r.getLocalName())) {
-                        result.add(current);
-                        current = null;
-                        depth = 0;
-                    } else if (current != null) {
-                        depth--;
-                    }
-                }
-            }
-            r.close();
-        } catch (Exception e) {
-            LOG.debugv("Ignoring malformed XML during parse: {0}", e.getMessage());
-        }
-        return result;
+    @FunctionalInterface
+    private interface LeafCollector<T> {
+        void add(Map<String, T> group, String name, String text);
     }
 
     /**
@@ -402,6 +479,10 @@ public final class XmlParser {
                     .filter(child -> childName.equals(child.name()))
                     .findFirst()
                     .orElse(null);
+        }
+
+        public long count(String childName) {
+            return children.stream().filter(child -> childName.equals(child.name())).count();
         }
     }
 

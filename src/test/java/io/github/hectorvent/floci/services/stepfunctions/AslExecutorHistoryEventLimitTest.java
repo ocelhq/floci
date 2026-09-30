@@ -2,11 +2,12 @@ package io.github.hectorvent.floci.services.stepfunctions;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.services.dynamodb.DynamoDbFacade;
 import io.github.hectorvent.floci.services.dynamodb.DynamoDbJsonHandler;
-import io.github.hectorvent.floci.services.dynamodb.DynamoDbService;
 import io.github.hectorvent.floci.services.lambda.LambdaExecutorService;
 import io.github.hectorvent.floci.services.lambda.LambdaFunctionStore;
 import io.github.hectorvent.floci.services.s3.S3Service;
+import io.github.hectorvent.floci.services.sns.SnsJsonHandler;
 import io.github.hectorvent.floci.services.sqs.SqsJsonHandler;
 import io.github.hectorvent.floci.services.stepfunctions.model.Execution;
 import io.github.hectorvent.floci.services.stepfunctions.model.HistoryEvent;
@@ -29,6 +30,7 @@ import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 /**
  * Guards the bound AWS puts on a running execution: a state machine that never reaches a terminal
@@ -183,12 +185,14 @@ class AslExecutorHistoryEventLimitTest {
 
     @BeforeEach
     void setUp() {
+        Instance<StepFunctionsService> sfnService = mock(Instance.class);
+        when(sfnService.get()).thenReturn(mock(StepFunctionsService.class));
         executor = new AslExecutor(
                 mock(LambdaExecutorService.class),
                 mock(LambdaFunctionStore.class),
-                mock(DynamoDbService.class),
+                mock(DynamoDbFacade.class),
                 mock(DynamoDbJsonHandler.class),
-                mock(SqsJsonHandler.class),
+                mock(SqsJsonHandler.class), mock(SnsJsonHandler.class),
                 mock(io.github.hectorvent.floci.services.cloudformation.CloudFormationQueryHandler.class),
                 mock(io.github.hectorvent.floci.services.ec2.Ec2Service.class),
                 mock(S3Service.class),
@@ -199,7 +203,7 @@ class AslExecutorHistoryEventLimitTest {
                 mock(io.github.hectorvent.floci.services.scheduler.SchedulerController.class),
                 objectMapper,
                 new JsonataEvaluator(objectMapper),
-                mock(Instance.class), mock(EmulatorConfig.class), vertx, null);
+                sfnService, mock(EmulatorConfig.class), vertx, null);
     }
 
     @Test
@@ -238,17 +242,20 @@ class AslExecutorHistoryEventLimitTest {
     }
 
     /**
-     * The branch produced the events that ran the execution out of them, and floci publishes none
-     * of them. What the caller reads back is the four events the top-level flow did produce, ending
-     * in the failure: an unbroken chain, not four events numbered as if 25,000 had happened.
+     * The branch produced the events that ran the execution out of them, and they are published
+     * into the execution's history like any other: what the caller reads back is one history,
+     * numbered without a gap and ending in the failure.
      */
     @Test
     void aParallelBranchLeavesThePublishedHistoryUnbroken() {
         run(RUNAWAY_PARALLEL_BRANCH);
 
         assertEquals(List.of("PassStateEntered", "PassStateExited", "ParallelStateEntered",
-                             "ExecutionFailed"),
-                history.stream().map(HistoryEvent::getType).toList());
+                             "ParallelStateStarted", "ChoiceStateEntered"),
+                history.subList(0, 5).stream().map(HistoryEvent::getType).toList());
+        HistoryEvent last = history.get(history.size() - 1);
+        assertEquals("ExecutionFailed", last.getType());
+        assertEquals(25_000, history.size());
         for (int index = 0; index < history.size(); index++) {
             assertEquals(index + 1L, history.get(index).getId(), "unexpected id at index " + index);
             assertEquals((long) index, history.get(index).getPreviousEventId(),

@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.applicationautoscaling;
 import com.fasterxml.jackson.core.type.TypeReference;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.common.ServicePrincipals;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.applicationautoscaling.model.Alarm;
@@ -491,9 +492,9 @@ public class ApplicationAutoScalingService {
             case "elasticache" -> "ElastiCacheRG";
             default -> "CustomResource";
         };
-        return "arn:aws:iam::" + regionResolver.getAccountId()
-                + ":role/aws-service-role/" + serviceNamespace + ".application-autoscaling.amazonaws.com/"
-                + "AWSServiceRoleForApplicationAutoScaling_" + suffix;
+        return regionResolver.buildGlobalArn("iam",
+                "role/aws-service-role/" + ServicePrincipals.of(serviceNamespace + ".application-autoscaling") + "/"
+                + "AWSServiceRoleForApplicationAutoScaling_" + suffix);
     }
 
     private static double nowEpochSeconds() {

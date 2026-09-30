@@ -7,6 +7,7 @@ import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.nio.charset.StandardCharsets;
+import java.time.Clock;
 import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
@@ -18,7 +19,7 @@ class RuleSqlEvaluatorTest {
 
     private static final String SHADOW_TOPIC = "$aws/things/sensor-1/shadow/name/building/update/accepted";
 
-    private final RuleSqlEvaluator evaluator = new RuleSqlEvaluator(new ObjectMapper());
+    private final RuleSqlEvaluator evaluator = new RuleSqlEvaluator(new ObjectMapper(), Clock.systemUTC());
 
     @Test
     void selectAllWithoutWhereForwardsTheOriginalBytes() {
@@ -259,6 +260,29 @@ class RuleSqlEvaluatorTest {
                 "{\"level\":9007199254740993}").isPresent());
     }
 
+    @ParameterizedTest
+    @CsvSource(delimiter = '|', value = {
+            "level = 1e5              | {\"level\":100000}             | true",
+            "level = 1e5              | {\"level\":1}                  | false",
+            "level > 1E-3             | {\"level\":0.01}               | true",
+            "level > 1E-3             | {\"level\":0}                  | false",
+            "level < 2.5e+3           | {\"level\":2499.9}             | true",
+            "level < 2.5e+3           | {\"level\":2500}               | false",
+            "n = 99999999999999999999 | {\"n\":99999999999999999999}   | true",
+            "n = 99999999999999999999 | {\"n\":1}                      | false",
+            "n > 99999999999999999999 | {\"n\":100000000000000000000}  | true"
+    })
+    void filtersOnAnExponentOrBigIntegerLiteral(String predicate, String payload, boolean fires) {
+        assertEquals(fires, evaluate("SELECT * FROM 'a/b' WHERE " + predicate, "a/b", payload).isPresent());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"1e5", "1E-3", "2.5e+3", "99999999999999999999"})
+    void projectsANumberLiteralAsTheSamePayloadNumberIsProjected(String number) {
+        assertEquals(text(evaluate("SELECT level FROM 'a/b'", "a/b", "{\"level\":" + number + "}")),
+                text(evaluate("SELECT " + number + " AS level FROM 'a/b'", "a/b", "{}")));
+    }
+
     @Test
     void skipsANonJsonPayloadWhenTheStatementNeedsFields() {
         assertFalse(evaluate("SELECT *, topic() as topic FROM 'a/b'", "a/b", "plain text").isPresent());
@@ -286,7 +310,7 @@ class RuleSqlEvaluatorTest {
     }
 
     private Optional<byte[]> evaluate(String sql, String topic, byte[] payload) {
-        return evaluator.evaluate("test-rule", RuleSqlParser.parse(sql), topic, payload);
+        return evaluator.evaluate("test-rule", RuleSqlParser.parse(sql), new RuleSqlContext(topic, null, "000000000000"), payload);
     }
 
     private String text(Optional<byte[]> result) {

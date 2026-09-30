@@ -506,6 +506,31 @@ class Ec2IntegrationTest {
     }
 
     @Test
+    @Order(9)
+    void describeImagesWithAl2023Arm64Filters() {
+        given()
+            .formParam("Action", "DescribeImages")
+            .formParam("Owner.1", "amazon")
+            .formParam("Filter.1.Name", "name")
+            .formParam("Filter.1.Value.1", "al2023-ami-2023.*-arm64")
+            .formParam("Filter.2.Name", "architecture")
+            .formParam("Filter.2.Value.1", "arm64")
+            .formParam("Filter.3.Name", "state")
+            .formParam("Filter.3.Value.1", "available")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .contentType("application/xml")
+            .body("DescribeImagesResponse.imagesSet.item.size()", equalTo(1))
+            .body("DescribeImagesResponse.imagesSet.item.imageId", equalTo("ami-amazonlinux2023-arm64"))
+            .body("DescribeImagesResponse.imagesSet.item.architecture", equalTo("arm64"))
+            .body("DescribeImagesResponse.imagesSet.item.name",
+                    equalTo("al2023-ami-2023.0.20230315.0-kernel-6.1-arm64"));
+    }
+
+    @Test
     // Runs after the DescribeNetworkInterfaces pagination tests at @Order(92), like the
     // metadata test below. Terminating the source instance is not enough on its own:
     // TerminateInstances flips the state to shutting-down synchronously and only reaches
@@ -794,6 +819,14 @@ class Ec2IntegrationTest {
             .body("DescribeInstanceTypesResponse.instanceTypeSet.item.instanceStorageInfo.totalSizeInGB", equalTo("474"))
             .body("DescribeInstanceTypesResponse.instanceTypeSet.item.networkInfo.encryptionInTransitSupported",
                     equalTo("false"))
+            .body("DescribeInstanceTypesResponse.instanceTypeSet.item.networkInfo.defaultNetworkCardIndex",
+                    equalTo("0"))
+            .body("DescribeInstanceTypesResponse.instanceTypeSet.item.networkInfo.ipv4AddressesPerInterface",
+                    equalTo("15"))
+            .body("DescribeInstanceTypesResponse.instanceTypeSet.item.networkInfo.networkCards.item.networkCardIndex",
+                    equalTo("0"))
+            .body("DescribeInstanceTypesResponse.instanceTypeSet.item.networkInfo.networkCards.item.maximumNetworkInterfaces",
+                    equalTo("4"))
             .body("DescribeInstanceTypesResponse.instanceTypeSet.item.processorInfo.supportedArchitectures.item",
                     equalTo("arm64"));
     }
@@ -825,6 +858,14 @@ class Ec2IntegrationTest {
                     everyItem(equalTo("118")))
             .body("DescribeInstanceTypesResponse.instanceTypeSet.item.networkInfo.encryptionInTransitSupported",
                     everyItem(equalTo("false")))
+            .body("DescribeInstanceTypesResponse.instanceTypeSet.item.networkInfo.defaultNetworkCardIndex",
+                    everyItem(equalTo("0")))
+            .body("DescribeInstanceTypesResponse.instanceTypeSet.item.networkInfo.ipv4AddressesPerInterface",
+                    everyItem(equalTo("10")))
+            .body("DescribeInstanceTypesResponse.instanceTypeSet.item.networkInfo.networkCards.item.networkCardIndex",
+                    everyItem(equalTo("0")))
+            .body("DescribeInstanceTypesResponse.instanceTypeSet.item.networkInfo.networkCards.item.maximumNetworkInterfaces",
+                    everyItem(equalTo("3")))
             .body("DescribeInstanceTypesResponse.instanceTypeSet.item.processorInfo.supportedArchitectures.item",
                     everyItem(equalTo("arm64")));
     }
@@ -957,6 +998,148 @@ class Ec2IntegrationTest {
         .then()
             .statusCode(200)
             .body("DescribeVpcsResponse.vpcSet.item.vpcId", equalTo(vpcId));
+    }
+
+    @Test
+    @Order(323)
+    void describeVpnGatewaysReturnsEmptySetAndNotFoundError() {
+        given()
+            .formParam("Action", "DescribeVpnGateways")
+            .formParam("Filter.1.Name", "attachment.vpc-id")
+            .formParam("Filter.1.Value.1", vpcId)
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeVpnGatewaysResponse.vpnGatewaySet.item.size()", equalTo(0));
+
+        given()
+            .formParam("Action", "DescribeVpnGateways")
+            .formParam("Filter.1.Name", "tag-value")
+            .formParam("Filter.1.Value.1", "TeamA")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeVpnGatewaysResponse.vpnGatewaySet.item.size()", equalTo(0));
+
+        given()
+            .formParam("Action", "DescribeVpnGateways")
+            .formParam("VpnGatewayId.1", "vgw-0123456789abcdef0")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body("Response.Errors.Error.Code", equalTo("InvalidVpnGatewayID.NotFound"))
+            .body("Response.Errors.Error.Message",
+                    equalTo("The vpnGateway ID 'vgw-0123456789abcdef0' does not exist"));
+    }
+
+    @Test
+    @Order(324)
+    void describeEgressOnlyInternetGatewaysReturnsEmptySet() {
+        given()
+            .formParam("Action", "DescribeEgressOnlyInternetGateways")
+            .formParam("Filter.1.Name", "tag:Owner")
+            .formParam("Filter.1.Value.1", "TeamA")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeEgressOnlyInternetGatewaysResponse.egressOnlyInternetGatewaySet.item.size()",
+                    equalTo(0));
+
+        given()
+            .formParam("Action", "DescribeEgressOnlyInternetGateways")
+            .formParam("Filter.1.Name", "tag-value")
+            .formParam("Filter.1.Value.1", "TeamA")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeEgressOnlyInternetGatewaysResponse.egressOnlyInternetGatewaySet.item.size()",
+                    equalTo(0));
+
+        given()
+            .formParam("Action", "DescribeEgressOnlyInternetGateways")
+            .formParam("Filter.1.Name", "attachment.vpc-id")
+            .formParam("Filter.1.Value.1", vpcId)
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeEgressOnlyInternetGatewaysResponse.egressOnlyInternetGatewaySet.item.size()",
+                    equalTo(0));
+
+        given()
+            .formParam("Action", "DescribeEgressOnlyInternetGateways")
+            .formParam("Filter.1.Name", "unsupported")
+            .formParam("Filter.1.Value.1", "value")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body("Response.Errors.Error.Code", equalTo("InvalidParameterValue"))
+            .body("Response.Errors.Error.Message",
+                    equalTo("The filter 'unsupported' is invalid"));
+
+        given()
+            .formParam("Action", "DescribeEgressOnlyInternetGateways")
+            .formParam("EgressOnlyInternetGatewayId.1", "eigw-0123456789abcdef0")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeEgressOnlyInternetGatewaysResponse.egressOnlyInternetGatewaySet.item.size()",
+                    equalTo(0));
+    }
+
+    @Test
+    @Order(325)
+    void emptyNetworkDiscoveryValidatesPaginationBeforeReturningResults() {
+        String action = "DescribeEgressOnlyInternetGateways";
+        int maximum = 255;
+        for (String maxResults : List.of("5", Integer.toString(maximum))) {
+            given()
+                .formParam("Action", action)
+                .formParam("MaxResults", maxResults)
+                .header("Authorization", AUTH_HEADER)
+            .when()
+                .post("/")
+            .then()
+                .statusCode(200)
+                .body(not(containsString("<nextToken>")));
+        }
+
+        for (String maxResults : List.of("4", Integer.toString(maximum + 1), "not-a-number")) {
+            given()
+                .formParam("Action", action)
+                .formParam("MaxResults", maxResults)
+                .header("Authorization", AUTH_HEADER)
+            .when()
+                .post("/")
+            .then()
+                .statusCode(400)
+                .body("Response.Errors.Error.Code", equalTo("InvalidMaxResults"));
+        }
+
+        given()
+            .formParam("Action", action)
+            .formParam("NextToken", "arbitrary-token")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body("Response.Errors.Error.Code", equalTo("InvalidParameterValue"));
     }
 
     @Test
@@ -1101,6 +1284,24 @@ class Ec2IntegrationTest {
             .statusCode(400)
             .body("Response.Errors.Error.Code", equalTo("MissingParameter"))
             .body("Response.Errors.Error.Message", equalTo("The request must contain the parameter VpcId"));
+    }
+
+    @Test
+    @Order(21)
+    void createSubnetWithConflictingCidrReturnsInvalidSubnetConflict() {
+        given()
+            .formParam("Action", "CreateSubnet")
+            .formParam("VpcId", vpcId)
+            .formParam("CidrBlock", "10.0.1.128/25")
+            .formParam("AvailabilityZone", "us-east-1a")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body("Response.Errors.Error.Code", equalTo("InvalidSubnet.Conflict"))
+            .body("Response.Errors.Error.Message",
+                    equalTo("The CIDR '10.0.1.128/25' conflicts with another subnet"));
     }
 
     @Test
@@ -1314,6 +1515,36 @@ class Ec2IntegrationTest {
     }
 
     @Test
+    void createSecurityGroupMissingGroupName() {
+        given()
+            .formParam("Action", "CreateSecurityGroup")
+            .formParam("GroupDescription", "Test security group")
+            .formParam("VpcId", vpcId)
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body(containsString("MissingParameter"))
+            .body(containsString("GroupName"));
+    }
+
+    @Test
+    void createSecurityGroupMissingDescription() {
+        given()
+            .formParam("Action", "CreateSecurityGroup")
+            .formParam("GroupName", "test-security-group")
+            .formParam("VpcId", vpcId)
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body(containsString("MissingParameter"))
+            .body(containsString("GroupDescription"));
+    }
+
+    @Test
     @Order(31)
     void authorizeSecurityGroupIngress() {
         given()
@@ -1464,7 +1695,7 @@ class Ec2IntegrationTest {
             .statusCode(200)
             .extract().path("CreateSecurityGroupResponse.groupId");
 
-        given()
+        String decoyGroupId = given()
             .formParam("Action", "CreateSecurityGroup")
             .formParam("GroupName", "description-filter-decoy")
             .formParam("GroupDescription", "A totally different description")
@@ -1473,7 +1704,8 @@ class Ec2IntegrationTest {
         .when()
             .post("/")
         .then()
-            .statusCode(200);
+            .statusCode(200)
+            .extract().path("CreateSecurityGroupResponse.groupId");
 
         // Positive case: filtering by the exact description of `targetGroupId` returns
         // exactly that one group out of the three now in this VPC (its own default group,
@@ -1509,6 +1741,24 @@ class Ec2IntegrationTest {
         .then()
             .statusCode(200)
             .body("DescribeSecurityGroupsResponse.securityGroupInfo.item.size()", equalTo(0));
+
+        given()
+            .formParam("Action", "DeleteSecurityGroup")
+            .formParam("GroupId", targetGroupId)
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        given()
+            .formParam("Action", "DeleteSecurityGroup")
+            .formParam("GroupId", decoyGroupId)
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
 
         given()
             .formParam("Action", "DeleteVpc")
@@ -1915,6 +2165,55 @@ class Ec2IntegrationTest {
     }
 
     @Test
+    @Order(41)
+    void createKeyPairWithoutKeyNameReturnsMissingParameter() {
+        // #3356: a nameless key pair used to be stored, and its null name then broke every
+        // later CreateKeyPair with an InternalFailure.
+        given()
+            .formParam("Action", "CreateKeyPair")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body("Response.Errors.Error.Code", equalTo("MissingParameter"));
+
+        given()
+            .formParam("Action", "ImportKeyPair")
+            .formParam("PublicKeyMaterial", "c3NoLXJzYSBBQUFB")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body("Response.Errors.Error.Code", equalTo("MissingParameter"));
+
+        given()
+            .formParam("Action", "DeleteKeyPair")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body("Response.Errors.Error.Code", equalTo("MissingParameter"));
+    }
+
+    @Test
+    @Order(41)
+    void importKeyPairWithInvalidBase64ReturnsInvalidKeyFormat() {
+        given()
+            .formParam("Action", "ImportKeyPair")
+            .formParam("KeyName", "bad-material-key")
+            .formParam("PublicKeyMaterial", "not base64!")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body("Response.Errors.Error.Code", equalTo("InvalidKey.Format"));
+    }
+
+    @Test
     @Order(42)
     void createLaunchTemplateRejectsMalformedUserData() {
         given()
@@ -1979,6 +2278,35 @@ class Ec2IntegrationTest {
                     equalTo(launchTemplateId))
             .body("DescribeLaunchTemplatesResponse.launchTemplates.item.launchTemplateName",
                     equalTo("sample-template"));
+    }
+
+    @Test
+    @Order(44)
+    void describeLaunchTemplatesRejectsMissingName() {
+        given()
+            .formParam("Action", "DescribeLaunchTemplates")
+            .formParam("LaunchTemplateName.1", "no-such-template")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body("Response.Errors.Error.Code", equalTo("InvalidLaunchTemplateName.NotFoundException"));
+    }
+
+    @Test
+    @Order(44)
+    void describeLaunchTemplatesWithNoMatchingFilterStaysAnEmptyList() {
+        given()
+            .formParam("Action", "DescribeLaunchTemplates")
+            .formParam("Filter.1.Name", "launch-template-name")
+            .formParam("Filter.1.Value.1", "no-such-template")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(not(containsString("<item>")));
     }
 
     @Test
@@ -2142,6 +2470,9 @@ class Ec2IntegrationTest {
     @Test
     @Order(49)
     void runInstancesResolvesLaunchTemplateDefaultsWithRequestOverrides() {
+        given().header("Authorization", AUTH_HEADER.replace("/ec2/", "/iam/"))
+                .formParam("Action", "CreateInstanceProfile").formParam("InstanceProfileName", "sample-profile-v2")
+                .post("/").then().statusCode(200);
         String launchedInstanceId = given()
             .formParam("Action", "RunInstances")
             .formParam("LaunchTemplate.LaunchTemplateId", launchTemplateId)
@@ -3735,10 +4066,12 @@ class Ec2IntegrationTest {
         .when()
             .post("/")
         .then()
-            .statusCode(200);
+            .statusCode(200)
+            .body("DeleteKeyPairResponse.return", equalTo("true"))
+            .body("DeleteKeyPairResponse.keyPairId", equalTo(keyPairId));
 
-        // DeleteKeyPair always answers 200, so the delete is only proven by a
-        // follow-up describe.
+        // DeleteKeyPair answers 200 for a known and an unknown key pair alike, so the
+        // delete is only proven by a follow-up describe.
         given()
             .formParam("Action", "DescribeKeyPairs")
             .formParam("KeyPairId.1", keyPairId)
@@ -4393,9 +4726,20 @@ class Ec2IntegrationTest {
             .formParam("TagSpecification.1.ResourceType", "subnet")
             .formParam("TagSpecification.1.Tag.1.Key", "Name")
             .formParam("TagSpecification.1.Tag.1.Value", "tagged-subnet")
+            .formParam("TagSpecification.2.ResourceType", "subnet")
+            .formParam("TagSpecification.2.Tag.1.Key", "omitted-value")
+            .formParam("TagSpecification.2.Tag.2.Key", "explicit-empty-value")
+            .formParam("TagSpecification.2.Tag.2.Value", "")
             .header("Authorization", AUTH_HEADER)
         .when().post("/")
-        .then().statusCode(200)
+        .then()
+            .statusCode(200)
+            .body("CreateSubnetResponse.subnet.tagSet.item.find { it.key == 'Name' }.value",
+                    equalTo("tagged-subnet"))
+            .body("CreateSubnetResponse.subnet.tagSet.item.find { it.key == 'omitted-value' }.value",
+                    equalTo(""))
+            .body("CreateSubnetResponse.subnet.tagSet.item.find { it.key == 'explicit-empty-value' }.value",
+                    equalTo(""))
             .extract().path("CreateSubnetResponse.subnet.subnetId");
 
         given()
@@ -4405,8 +4749,27 @@ class Ec2IntegrationTest {
         .when().post("/")
         .then()
             .statusCode(200)
-            .body("DescribeSubnetsResponse.subnetSet.item.tagSet.item.key", equalTo("Name"))
-            .body("DescribeSubnetsResponse.subnetSet.item.tagSet.item.value", equalTo("tagged-subnet"));
+            .body("DescribeSubnetsResponse.subnetSet.item.tagSet.item.find { it.key == 'Name' }.value",
+                    equalTo("tagged-subnet"))
+            .body("DescribeSubnetsResponse.subnetSet.item.tagSet.item.find { it.key == 'omitted-value' }.value",
+                    equalTo(""))
+            .body("DescribeSubnetsResponse.subnetSet.item.tagSet.item.find { it.key == 'explicit-empty-value' }.value",
+                    equalTo(""));
+
+        given()
+            .formParam("Action", "DescribeTags")
+            .formParam("Filter.1.Name", "resource-id")
+            .formParam("Filter.1.Value.1", subnet)
+            .header("Authorization", AUTH_HEADER)
+        .when().post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeTagsResponse.tagSet.item.find { it.key == 'Name' }.value",
+                    equalTo("tagged-subnet"))
+            .body("DescribeTagsResponse.tagSet.item.find { it.key == 'omitted-value' }.value",
+                    equalTo(""))
+            .body("DescribeTagsResponse.tagSet.item.find { it.key == 'explicit-empty-value' }.value",
+                    equalTo(""));
     }
 
     @Test

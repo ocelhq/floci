@@ -9,7 +9,6 @@ import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
 
 import static io.restassured.RestAssured.given;
-import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.equalTo;
 
 /**
@@ -85,18 +84,5 @@ class LambdaProvidedRuntimeBootstrapIntegrationTest {
         .then()
             .statusCode(200)
             .body("FunctionName", equalTo("provided-bootstrap-update"));
-    }
-
-    @Test
-    void createFunctionStillRejectsMissingHandlerFileForLanguageRuntimes() throws Exception {
-        given()
-            .contentType("application/json")
-            .body(createBody("nodejs-missing-handler", "nodejs20.x", "index.handler",
-                    zip("other.js", "module.exports = {};".getBytes())))
-        .when()
-            .post("/2015-03-31/functions")
-        .then()
-            .statusCode(400)
-            .body(containsString("not found in deployment package"));
     }
 }

@@ -29,11 +29,13 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.function.LongSupplier;
+import java.util.stream.Collectors;
 
 /**
  * Polls SQS queues on behalf of Lambda Event Source Mappings.
  * Uses Vert.x periodic timers so polling is non-blocking.
- * Injects LambdaExecutorService + LambdaFunctionStore directly (not LambdaService)
+ * Injects LambdaExecutorService + LambdaTargetResolver directly (not LambdaService)
  * to avoid a circular CDI dependency.
  */
 @ApplicationScoped
@@ -47,7 +49,7 @@ public class SqsEventSourcePoller implements Resettable {
     private final Vertx vertx;
     private final SqsService sqsService;
     private final LambdaExecutorService executorService;
-    private final LambdaFunctionStore functionStore;
+    private final LambdaTargetResolver targetResolver;
     private final EsmStore esmStore;
     private final long pollIntervalMs;
     private final String baseUrl;
@@ -56,6 +58,11 @@ public class SqsEventSourcePoller implements Resettable {
     private final ConcurrentHashMap<String, Long> timerIds = new ConcurrentHashMap<>();
     // Tracks ESMs with an in-flight poll to prevent concurrent deliveries of the same message
     private final ConcurrentHashMap<String, Boolean> activePolls = new ConcurrentHashMap<>();
+    // Underfilled batches held open by MaximumBatchingWindowInSeconds, keyed by ESM uuid. Only ever
+    // mutated inside the activePolls-guarded section, so one thread touches a given entry at a time.
+    private final ConcurrentHashMap<String, PendingBatch> pendingBatches = new ConcurrentHashMap<>();
+    // Wall clock for the batching-window deadline; overridable so tests can advance it without sleeping.
+    private volatile LongSupplier clockMs = System::currentTimeMillis;
     private final ExecutorService pollExecutor = Executors.newCachedThreadPool(r -> {
         Thread t = new Thread(r, "esm-poller");
         t.setDaemon(true);
@@ -65,14 +72,14 @@ public class SqsEventSourcePoller implements Resettable {
     @Inject
     public SqsEventSourcePoller(Vertx vertx, SqsService sqsService,
                                 LambdaExecutorService executorService,
-                                LambdaFunctionStore functionStore,
+                                LambdaTargetResolver targetResolver,
                                 EsmStore esmStore, EmulatorConfig config,
                                 ObjectMapper objectMapper,
                                 PipesFilterMatcher filterMatcher) {
         this.vertx = vertx;
         this.sqsService = sqsService;
         this.executorService = executorService;
-        this.functionStore = functionStore;
+        this.targetResolver = targetResolver;
         this.esmStore = esmStore;
         this.pollIntervalMs = config.services().lambda().pollIntervalMs();
         this.baseUrl = config.effectiveBaseUrl();
@@ -102,6 +109,18 @@ public class SqsEventSourcePoller implements Resettable {
         timerIds.values().forEach(vertx::cancelTimer);
         timerIds.clear();
         activePolls.clear();
+        pendingBatches.clear();
+    }
+
+    /** Test seam: replace the wall clock used for the batching-window deadline. */
+    void setClockForTest(LongSupplier clockMs) {
+        this.clockMs = clockMs;
+    }
+
+    /** Messages received across earlier polls that a batching window is still holding open. */
+    private static final class PendingBatch {
+        final List<Message> messages = new ArrayList<>();
+        long windowStartedAtMs;
     }
 
     public void startPolling(EventSourceMapping esm) {
@@ -126,6 +145,7 @@ public class SqsEventSourcePoller implements Resettable {
 
     public void stopPolling(String uuid) {
         Long timerId = timerIds.remove(uuid);
+        pendingBatches.remove(uuid);
         if (timerId != null) {
             vertx.cancelTimer(timerId);
             LOG.debugv("Stopped polling ESM {0}", uuid);
@@ -145,20 +165,63 @@ public class SqsEventSourcePoller implements Resettable {
                 // Look up the function first so we can set an appropriate visibility
                 // timeout: fn.timeout + 30s keeps messages hidden while Lambda runs.
                 // Use account-scoped lookup since this runs outside request scope.
-                LambdaFunction fn = functionStore.getForAccount(esm.getAccountId(), esm.getRegion(), esm.getFunctionName())
-                        .orElse(null);
+                LambdaFunction fn = targetResolver.resolveMappingTarget(esm).orElse(null);
                 if (fn == null) {
                     LOG.warnv("ESM {0}: function {1} not found in region {2}, skipping",
                             esm.getUuid(), esm.getFunctionName(), esm.getRegion());
                     return;
                 }
 
-                int visibilityTimeout = fn.getTimeout() + 30;
-                List<Message> messages = sqsService.receiveMessage(
-                        esm.getQueueUrl(), esm.getBatchSize(), visibilityTimeout, 0, esm.getRegion());
+                // MaximumBatchingWindowInSeconds holds an underfilled batch open: keep messages
+                // received across earlier polls invisible and only invoke once the batch fills or
+                // the window since the first buffered message expires.
+                int window = esm.getMaximumBatchingWindowInSeconds() == null
+                        ? 0 : esm.getMaximumBatchingWindowInSeconds();
+                // A message can be buffered for the whole window and then processed for the full
+                // function timeout, so visibility has to cover both plus AWS's 30s margin, not the
+                // larger of the two. Otherwise a long invoke can outlive the visibility and another
+                // consumer receives the message, causing a duplicate delivery and a stale handle.
+                int visibilityTimeout = fn.getTimeout() + Math.max(window, 0) + 30;
 
-                if (messages.isEmpty()) {
-                    return;
+                PendingBatch pending = pendingBatches.get(esm.getUuid());
+                int alreadyBuffered = pending != null ? pending.messages.size() : 0;
+                int wanted = Math.max(1, esm.getBatchSize() - alreadyBuffered);
+
+                List<Message> received = sqsService.receiveMessage(
+                        esm.getQueueUrl(), wanted, visibilityTimeout, 0, esm.getRegion());
+
+                List<Message> messages;
+                if (window <= 0) {
+                    // No window, or one that was just turned off: deliver now, draining anything a
+                    // previous positive window had buffered so those messages are not stranded
+                    // until their visibility expires (and cannot be replayed if the window returns).
+                    List<Message> batch = pending != null ? pending.messages : new ArrayList<>();
+                    pendingBatches.remove(esm.getUuid());
+                    batch.addAll(received);
+                    if (batch.isEmpty()) {
+                        return;
+                    }
+                    messages = batch;
+                } else {
+                    if (pending == null) {
+                        pending = new PendingBatch();
+                        pendingBatches.put(esm.getUuid(), pending);
+                    }
+                    if (pending.messages.isEmpty() && !received.isEmpty()) {
+                        pending.windowStartedAtMs = clockMs.getAsLong();
+                    }
+                    pending.messages.addAll(received);
+                    if (pending.messages.isEmpty()) {
+                        return;
+                    }
+                    boolean batchFull = pending.messages.size() >= esm.getBatchSize();
+                    boolean windowElapsed =
+                            clockMs.getAsLong() - pending.windowStartedAtMs >= window * 1000L;
+                    if (!batchFull && !windowElapsed) {
+                        return;
+                    }
+                    messages = new ArrayList<>(pending.messages);
+                    pendingBatches.remove(esm.getUuid());
                 }
 
                 LOG.infov("ESM {0}: received {1} message(s)", esm.getUuid(), messages.size());
@@ -211,7 +274,7 @@ public class SqsEventSourcePoller implements Resettable {
                 if (result.getFunctionError() == null) {
                     // Only the delivered (matched) messages are subject to delete/return here; filtered-out
                     // messages were already deleted above, so a batchItemFailure id that names one is inert.
-                    Set<String> failedIds = extractBatchItemFailures(esm, result);
+                    Set<String> failedIds = extractBatchItemFailures(esm, result, messages);
                     List<Message> toDelete = failedIds.isEmpty()
                             ? matched
                             : matched.stream().filter(m -> !failedIds.contains(m.getMessageId())).toList();
@@ -293,29 +356,51 @@ public class SqsEventSourcePoller implements Resettable {
         return DEFAULT_RETRY_VISIBILITY_SECONDS;
     }
 
-    private Set<String> extractBatchItemFailures(EventSourceMapping esm, InvokeResult result) {
+    /**
+     * Message IDs the function reported as failed via {@code ReportBatchItemFailures}, following
+     * the AWS success/failure conditions: an empty or null list, or an empty or null response, is
+     * a complete success, while invalid JSON, a non-array list, an entry without
+     * {@code itemIdentifier}, or an empty, null or unknown identifier fails the whole batch, so
+     * every received message is reported as failed and the delivered ones are returned to the
+     * queue. Identifiers are validated against the received batch, so a filtered-out message's
+     * id stays inert rather than failing the batch.
+     */
+    private Set<String> extractBatchItemFailures(EventSourceMapping esm, InvokeResult result,
+                                                 List<Message> received) {
         if (!esm.isReportBatchItemFailures() || result.getPayload() == null || result.getPayload().length == 0) {
             return Set.of();
         }
+        Set<String> receivedIds = received.stream().map(Message::getMessageId).collect(Collectors.toSet());
         try {
-            var root = objectMapper.readTree(result.getPayload());
-            var failures = root.get("batchItemFailures");
-            if (failures == null || !failures.isArray()) {
+            var failures = objectMapper.readTree(result.getPayload()).get("batchItemFailures");
+            if (failures == null || failures.isNull()) {
                 return Set.of();
+            }
+            if (!failures.isArray()) {
+                return failWholeBatch(esm, receivedIds, "batchItemFailures is not an array");
             }
             Set<String> failedIds = new HashSet<>();
             for (var item : failures) {
                 var id = item.get("itemIdentifier");
-                if (id != null && !id.isNull()) {
-                    failedIds.add(id.asText());
+                if (id == null || id.isNull() || id.asText().isEmpty()) {
+                    return failWholeBatch(esm, receivedIds, "entry has a missing, null or empty itemIdentifier");
                 }
+                if (!receivedIds.contains(id.asText())) {
+                    return failWholeBatch(esm, receivedIds,
+                            "itemIdentifier " + id.asText() + " is not in the received batch");
+                }
+                failedIds.add(id.asText());
             }
             return failedIds;
         } catch (Exception e) {
-            LOG.warnv("ESM {0}: failed to parse batchItemFailures from Lambda response: {1}",
-                    esm.getUuid(), e.getMessage());
-            return Set.of();
+            return failWholeBatch(esm, receivedIds, "response is not valid JSON: " + e.getMessage());
         }
+    }
+
+    private Set<String> failWholeBatch(EventSourceMapping esm, Set<String> receivedIds, String reason) {
+        LOG.warnv("ESM {0}: malformed batchItemFailures response ({1}), failing the whole batch",
+                esm.getUuid(), reason);
+        return receivedIds;
     }
 
     String buildSqsEvent(List<Message> messages, EventSourceMapping esm) {

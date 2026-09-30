@@ -95,6 +95,48 @@ Floci emulates EventBridge Pipes with the following supported source and target 
 - Kinesis streams
 - Step Functions state machines
 
+## ParallelizationFactor
+
+`CreatePipe` and `UpdatePipe` accept a `ParallelizationFactor` integer between 1 and 10 on the
+`KinesisStreamParameters` and `DynamoDBStreamParameters` source blocks, matching the AWS wire
+format. `DescribePipe` echoes it back as part of `SourceParameters`. `ListPipes` returns pipe
+summaries only and omits `SourceParameters` entirely, matching AWS.
+
+```bash
+aws pipes create-pipe \
+  --name kinesis-pipe \
+  --source "arn:aws:kinesis:us-east-1:000000000000:stream/events" \
+  --target "arn:aws:lambda:us-east-1:000000000000:function:my-function" \
+  --role-arn "arn:aws:iam::000000000000:role/pipe-role" \
+  --source-parameters '{"KinesisStreamParameters":{"StartingPosition":"TRIM_HORIZON","ParallelizationFactor":4}}' \
+  --endpoint-url $AWS_ENDPOINT_URL
+```
+
+Validation mirrors AWS: values outside 1 to 10 are rejected with `ValidationException`, and so is
+the field on a source its parameter block does not describe, for example
+`KinesisStreamParameters.ParallelizationFactor` on an SQS source.
+
+!!! note "Enforcement status"
+    The configured `ParallelizationFactor` is persisted and returned on the wire, but the poller
+    does not yet process concurrent batches per shard. Floci opens an iterator on a single shard
+    (`shardId-000000000000`) per Kinesis pipe, and reads the shards of a DynamoDB stream one batch
+    at a time, regardless of the configured value. Multi-shard Kinesis polling and real per-shard
+    concurrency are tracked as follow-ups.
+
+## DynamoDB Streams Source
+
+- `StartingPosition` `TRIM_HORIZON` and `LATEST` are honored. `LATEST` is pinned on the pipe's
+  first poll, so only records written after that poll are delivered.
+- Progress survives `StopPipe` and `StartPipe`: a restarted pipe resumes after the last record it
+  delivered or sent to the DLQ. The progress is kept in memory, so it is lost when Floci restarts.
+- Records are delivered in the AWS DynamoDB Streams record shape (`eventName`, `dynamodb.Keys`,
+  `dynamodb.NewImage` and so on) with `eventSourceARN` set to the stream ARN, so filter patterns on
+  `dynamodb.*` fields match as on AWS.
+- A failed batch is retried until it is delivered or sent to the `DeadLetterConfig` queue. When
+  some records of a batch reach a non-Lambda target and others fail, the whole batch is retried.
+- `MaximumRetryAttempts`, `MaximumRecordAgeInSeconds` and `OnPartialBatchItemFailure` are accepted
+  and returned but not enforced, so they do not bound or split those retries.
+
 ## Enrichment
 
 A pipe's optional enrichment step (`source → filter → enrichment → target`) is emulated for

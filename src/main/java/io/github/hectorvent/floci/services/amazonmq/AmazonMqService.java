@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.amazonmq;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.docker.ContainerStorageHelper;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
@@ -76,16 +77,29 @@ public class AmazonMqService implements ResourceProvider {
         if (name == null || name.isBlank()) {
             throw new AwsException("BadRequestException", "BrokerName is required", 400);
         }
-        if (!ENGINE_RABBITMQ.equals(params.engineType())) {
+        // EngineType is case-insensitive on real AWS, and the mixed-case spelling is the
+        // one the AWS docs, the console and the aws_mq_broker registry examples all use --
+        // so an exact match rejects the form virtually every Terraform module is written
+        // with. Distinguish the unsupported engine from an unrecognised one so the two
+        // failures are not reported identically.
+        if (!ENGINE_RABBITMQ.equalsIgnoreCase(params.engineType())) {
             throw new AwsException("BadRequestException",
-                    "Only RABBITMQ EngineType is supported", 400);
+                    "EngineType " + params.engineType() + " is not supported; only RabbitMQ is emulated",
+                    400);
         }
         String deploymentMode = params.deploymentMode() == null
                 ? DEPLOYMENT_SINGLE_INSTANCE : params.deploymentMode();
-        if (!DEPLOYMENT_SINGLE_INSTANCE.equals(deploymentMode)) {
+        // DeploymentMode has the same problem as EngineType above: the wire enum is upper case,
+        // but callers spell it however their tooling does, and the real API matches without
+        // regard to case. An exact compare rejected "single_instance" -- the one mode this
+        // emulator does support -- as unsupported.
+        if (!DEPLOYMENT_SINGLE_INSTANCE.equalsIgnoreCase(deploymentMode)) {
             throw new AwsException("BadRequestException",
                     "Only SINGLE_INSTANCE DeploymentMode is supported", 400);
         }
+        // Store the canonical wire casing, not the caller's, so DescribeBroker reads back the
+        // enum value the SDKs expect however the request happened to be spelled.
+        deploymentMode = DEPLOYMENT_SINGLE_INSTANCE;
         // RabbitMQ brokers require exactly one user at creation; that user becomes the
         // broker's RabbitMQ administrator (seeded into the container). This mirrors AWS,
         // which rejects CreateBroker for RabbitMQ unless exactly one user is supplied.
@@ -115,6 +129,10 @@ public class AmazonMqService implements ResourceProvider {
                 engineVersion, deploymentMode, params.hostInstanceType());
         broker.setAccountId(accountId);
         broker.setVolumeId(String.format("%06x", new SecureRandom().nextInt(0xFFFFFF)));
+        // Stamp the volume name now, with the current prefix, so it is persisted rather than
+        // recomputed later. Only records predating this field fall back to the legacy name.
+        broker.setDockerVolumeName(ContainerStorageHelper.resourceName(
+                config, "amazonmq", broker.getVolumeId(), broker.getBrokerId()));
         broker.setPubliclyAccessible(params.publiclyAccessible());
         broker.setAutoMinorVersionUpgrade(params.autoMinorVersionUpgrade());
         if (params.users() != null) {

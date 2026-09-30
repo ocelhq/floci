@@ -30,7 +30,7 @@ import java.util.Map;
  * A provisioner calls {@link #record} at the end of a successful {@code provision} and delegates
  * the cleanup hooks and {@link #rollback} here.
  */
-final class ReplacementCleanup {
+public final class ReplacementCleanup {
 
     private static final Logger LOG = Logger.getLogger(ReplacementCleanup.class);
     private static final ObjectMapper MAPPER = new ObjectMapper();
@@ -107,9 +107,9 @@ final class ReplacementCleanup {
             return true;
         }
         try {
-            deleter.delete(r.getResourceType(), replacement, region(cleanup, r));
+            deleter.delete(r.getResourceType(), replacement, region(cleanup));
         } catch (RuntimeException deleteFailure) {
-            addDisplaced(cleanup, replacement, r.getResourceType(), region(cleanup, r), false);
+            addDisplaced(cleanup, replacement, r.getResourceType(), region(cleanup), false);
             write(r, cleanup);
             throw deleteFailure;
         }
@@ -122,22 +122,38 @@ final class ReplacementCleanup {
     }
 
     /**
-     * The first entity still owed a delete, or null when none is or {@code UpdateReplacePolicy:
-     * Retain} keeps it. The engine announces one physical id per resource, so a resource owing
-     * more than one names the first; the rest are deleted in the same cleanup.
+     * The entity the cleanup is working on, or null when none is owed or {@code UpdateReplacePolicy:
+     * Retain} keeps it. The engine announces one physical id per resource, so a resource owing more
+     * than one names the one with the fewest attempts, the same entity {@link #complete} reports,
+     * so the progress and failure events of one cleanup name the same thing.
      */
     static String cleanupPhysicalId(StackResource r) {
         ObjectNode cleanup = read(r);
         if (cleanup == null) {
             return null;
         }
-        boolean retain = "Retain".equals(r.getUpdateReplacePolicy());
-        for (JsonNode entry : cleanup.path("displaced")) {
-            if (!(retain && entry.path("retainable").asBoolean(false))) {
-                return entry.path("physicalId").asText(null);
+        JsonNode next = nextOwed(cleanup.path("displaced"), r.getPhysicalId(), "Retain".equals(r.getUpdateReplacePolicy()));
+        return next == null ? null : next.path("physicalId").asText(null);
+    }
+
+    /**
+     * The owed entry with the fewest attempts, ties by list order: the one the engine's retries are
+     * still for. Skips the resource's own entity and, under Retain, the entities a committed
+     * replacement displaced.
+     */
+    private static JsonNode nextOwed(JsonNode displaced, String currentPhysicalId, boolean retain) {
+        JsonNode next = null;
+        for (JsonNode entry : displaced) {
+            String physicalId = entry.path("physicalId").asText(null);
+            if (physicalId == null || physicalId.equals(currentPhysicalId)
+                    || (retain && entry.path("retainable").asBoolean(false))) {
+                continue;
+            }
+            if (next == null || entry.path("cleanupAttempts").asInt(0) < next.path("cleanupAttempts").asInt(0)) {
+                next = entry;
             }
         }
-        return null;
+        return next;
     }
 
     /**
@@ -186,9 +202,6 @@ final class ReplacementCleanup {
         boolean retain = "Retain".equals(r.getUpdateReplacePolicy());
         ArrayNode displaced = cleanup.withArray("displaced");
         ArrayNode remaining = MAPPER.createArrayNode();
-        int attempts = Integer.MAX_VALUE;
-        String failureReason = null;
-        String firstRemaining = null;
         for (JsonNode node : displaced) {
             ObjectNode entry = (ObjectNode) node;
             String physicalId = entry.path("physicalId").asText(null);
@@ -209,24 +222,70 @@ final class ReplacementCleanup {
                 }
             }
             remaining.add(entry);
-            // The result names the entity with the fewest attempts, the one the engine's retries
-            // are still for, so its DELETE_FAILED event points at what is actually still owed.
-            if (entryAttempts < attempts) {
-                attempts = entryAttempts;
-                failureReason = entry.path("cleanupFailureReason").asText(null);
-                firstRemaining = physicalId;
-            }
         }
         cleanup.set("displaced", remaining);
         write(r, cleanup);
         if (remaining.isEmpty()) {
             return new UpdateCleanupResult(true, true, firstDisplaced(displaced), 0, null);
         }
-        return new UpdateCleanupResult(true, false, firstRemaining, attempts, failureReason);
+        // The result names the entity with the fewest attempts, the one the engine's retries are
+        // still for and the one cleanupPhysicalId announced, so both events point at the same thing.
+        JsonNode next = nextOwed(remaining, r.getPhysicalId(), retain);
+        return new UpdateCleanupResult(true, false, next.path("physicalId").asText(null),
+                next.path("cleanupAttempts").asInt(0), next.path("cleanupFailureReason").asText(null));
     }
 
     private static String firstDisplaced(ArrayNode displaced) {
         return displaced.isEmpty() ? null : displaced.get(0).path("physicalId").asText(null);
+    }
+
+    /**
+     * Lists an entity this provision created and could not remove after a later step failed, so
+     * the next committed update or the stack delete removes it instead of nothing ever trying
+     * again. Never retainable: a failed update created it.
+     */
+    static void recordOrphan(StackResource r, String physicalId, String resourceType, String region) {
+        ObjectNode cleanup = readOrEmpty(r);
+        if (region != null) {
+            cleanup.put("region", region);
+        }
+        addDisplaced(cleanup, physicalId, resourceType, region, false);
+        write(r, cleanup);
+    }
+
+    /**
+     * Carries the entities {@code from} owes a delete onto {@code into}, keeping their attempt
+     * counts and regions and skipping ids {@code into} already lists or owns. The engine calls this
+     * through {@code mergeFailedUpdateResourceTracking} when it restores the previous resource
+     * after a failed update, so an orphan the attempt recorded is not lost with the attempt.
+     */
+    public static void mergeDisplaced(StackResource into, StackResource from) {
+        ObjectNode source = read(from);
+        if (source == null || source.path("displaced").size() == 0) {
+            return;
+        }
+        ObjectNode target = readOrEmpty(into);
+        if (target.path("region").asText(null) == null && source.path("region").asText(null) != null) {
+            target.put("region", source.path("region").asText());
+        }
+        ArrayNode displaced = target.withArray("displaced");
+        for (JsonNode entry : source.path("displaced")) {
+            String physicalId = entry.path("physicalId").asText(null);
+            if (physicalId == null || physicalId.equals(into.getPhysicalId())) {
+                continue;
+            }
+            boolean present = false;
+            for (JsonNode existing : displaced) {
+                if (physicalId.equals(existing.path("physicalId").asText(null))) {
+                    present = true;
+                    break;
+                }
+            }
+            if (!present) {
+                displaced.add(entry.deepCopy());
+            }
+        }
+        write(into, target);
     }
 
     private static void addDisplaced(ObjectNode cleanup, String physicalId, String resourceType, String region,
@@ -257,7 +316,7 @@ final class ReplacementCleanup {
         kept.forEach(displaced::add);
     }
 
-    private static String region(ObjectNode cleanup, StackResource r) {
+    private static String region(ObjectNode cleanup) {
         return cleanup.path("region").asText(null);
     }
 

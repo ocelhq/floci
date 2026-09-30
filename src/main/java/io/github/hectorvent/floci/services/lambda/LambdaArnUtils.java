@@ -13,12 +13,39 @@ import java.util.regex.Pattern;
  */
 public final class LambdaArnUtils {
 
-    private static final Pattern NAME_PATTERN = Pattern.compile("[a-zA-Z0-9-_.]+");
-    private static final int MAX_NAME_LENGTH = 256;
+    /**
+     * FunctionName constraints from the Lambda API reference (CreateFunction, FunctionName):
+     * {@code [a-zA-Z0-9-_]+}, with no dot. A bare name (no ARN prefix) is capped at 64
+     * characters; the ARN and partial-ARN forms embed the same character class but are
+     * bounded instead by {@link #MAX_TOTAL_LENGTH} on the full string.
+     */
+    private static final Pattern NAME_PATTERN = Pattern.compile("[a-zA-Z0-9-_]+");
+    private static final int MAX_NAME_LENGTH = 64;
+    private static final int MAX_TOTAL_LENGTH = 140;
+    private static final String NAME_REGEX = "(arn:(aws[a-zA-Z-]*)?:lambda:)?([a-z]{2}(-gov)?-[a-z]+-\\d{1}:)?"
+            + "(\\d{12}:)?(function:)?([a-zA-Z0-9-_]+)(:(\\$LATEST|[a-zA-Z0-9-_]+))?";
     private static final Pattern ACCOUNT_PATTERN = Pattern.compile("\\d{12}");
     private static final Pattern QUALIFIER_PATTERN = Pattern.compile("\\$LATEST|[a-zA-Z0-9-_]+");
 
+    private static final String EVENT_SOURCE_MAPPING_PREFIX = "event-source-mapping:";
+
     private LambdaArnUtils() {}
+
+    /** {@code arn:<partition>:lambda:<region>:<account>:event-source-mapping:<uuid>}. */
+    public static String eventSourceMappingArn(String region, String accountId, String uuid) {
+        return AwsArnUtils.Arn.of("lambda", region, accountId, EVENT_SOURCE_MAPPING_PREFIX + uuid).toString();
+    }
+
+    /**
+     * The UUID of an event source mapping ARN, or {@code null} when {@code arn} names
+     * some other Lambda resource.
+     */
+    public static String eventSourceMappingUuid(AwsArnUtils.Arn arn) {
+        if (!"lambda".equals(arn.service()) || !arn.resource().startsWith(EVENT_SOURCE_MAPPING_PREFIX)) {
+            return null;
+        }
+        return arn.resource().substring(EVENT_SOURCE_MAPPING_PREFIX.length());
+    }
 
     /**
      * Resolved components of a Lambda function reference.
@@ -31,13 +58,18 @@ public final class LambdaArnUtils {
     public record ResolvedFunctionRef(String name, String qualifier, String region) {}
 
     /**
-     * Parses a {@code FunctionName} path parameter. Throws
-     * {@link AwsException} ({@code InvalidParameterValueException}, HTTP 400)
-     * on any malformed input.
+     * Parses a {@code FunctionName} path parameter. Throws {@link AwsException}, HTTP 400,
+     * on any malformed input: {@code ValidationException} when the name fails the
+     * {@code FunctionName} pattern or length constraint, {@code InvalidParameterValueException}
+     * for other malformed forms (bad ARN structure, mismatched qualifiers, and the like).
      */
     public static ResolvedFunctionRef resolve(String input) {
         if (input == null || input.isBlank()) {
             throw invalid("FunctionName must not be blank");
+        }
+        if (input.length() > MAX_TOTAL_LENGTH) {
+            throw validationFailure(input,
+                    "Member must have length less than or equal to " + MAX_TOTAL_LENGTH);
         }
 
         if (input.startsWith("arn:")) {
@@ -96,7 +128,7 @@ public final class LambdaArnUtils {
             throw invalid("ARN resource type must be 'function': " + input);
         }
         String name = resParts[1];
-        validateName(name);
+        validateNamePattern(name);
         String qualifier = resParts.length == 3 ? resParts[2] : null;
         if (qualifier != null) {
             validateQualifier(qualifier);
@@ -118,7 +150,7 @@ public final class LambdaArnUtils {
             throw invalid("Partial ARN has invalid account id: " + input);
         }
         String name = parts[2];
-        validateName(name);
+        validateNamePattern(name);
         String qualifier = parts.length == 4 ? parts[3] : null;
         if (qualifier != null) {
             validateQualifier(qualifier);
@@ -133,7 +165,7 @@ public final class LambdaArnUtils {
             throw invalid("Invalid FunctionName: " + input);
         }
         String name = parts[0];
-        validateName(name);
+        validateBareName(name);
         String qualifier = parts.length == 2 ? parts[1] : null;
         if (qualifier != null) {
             validateQualifier(qualifier);
@@ -141,15 +173,19 @@ public final class LambdaArnUtils {
         return new ResolvedFunctionRef(name, qualifier, null);
     }
 
-    private static void validateName(String name) {
+    private static void validateNamePattern(String name) {
         if (name == null || name.isEmpty()) {
             throw invalid("FunctionName segment is empty");
         }
-        if (name.length() > MAX_NAME_LENGTH) {
-            throw invalid("FunctionName exceeds maximum length of " + MAX_NAME_LENGTH + ": " + name);
-        }
         if (!NAME_PATTERN.matcher(name).matches()) {
-            throw invalid("FunctionName contains invalid characters: " + name);
+            throw validationFailure(name, "Member must satisfy regular expression pattern: " + NAME_REGEX);
+        }
+    }
+
+    private static void validateBareName(String name) {
+        validateNamePattern(name);
+        if (name.length() > MAX_NAME_LENGTH) {
+            throw validationFailure(name, "Member must have length less than or equal to " + MAX_NAME_LENGTH);
         }
     }
 
@@ -164,6 +200,12 @@ public final class LambdaArnUtils {
 
     private static AwsException invalid(String message) {
         return new AwsException("InvalidParameterValueException", message, 400);
+    }
+
+    private static AwsException validationFailure(String value, String constraint) {
+        return new AwsException("ValidationException",
+                "1 validation error detected: Value '" + value + "' at 'functionName' failed to satisfy "
+                        + "constraint: " + constraint, 400);
     }
 
     /**

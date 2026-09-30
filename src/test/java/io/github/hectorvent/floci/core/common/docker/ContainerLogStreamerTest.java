@@ -1,25 +1,131 @@
 package io.github.hectorvent.floci.core.common.docker;
 
+import com.github.dockerjava.api.DockerClient;
+import com.github.dockerjava.api.async.ResultCallback;
+import com.github.dockerjava.api.command.LogContainerCmd;
 import com.github.dockerjava.api.model.Frame;
 import com.github.dockerjava.api.model.StreamType;
+import io.github.hectorvent.floci.services.cloudwatch.logs.CloudWatchLogsService;
+import io.github.hectorvent.floci.testutil.LogCapture;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
+import org.mockito.ArgumentCaptor;
 
 import java.io.Closeable;
 import java.nio.charset.StandardCharsets;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.logging.LogRecord;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.ArgumentMatchers.anyList;
+import static org.mockito.ArgumentMatchers.argThat;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.RETURNS_SELF;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
 class ContainerLogStreamerTest {
 
     private static byte[] utf8(String s) {
         return s.getBytes(StandardCharsets.UTF_8);
+    }
+
+    @Test
+    void ensureLogGroupAndStreamUsesOwningAccount() {
+        CloudWatchLogsService cloudWatchLogsService = mock(CloudWatchLogsService.class);
+        ContainerLogStreamer streamer = new ContainerLogStreamer(null, cloudWatchLogsService);
+
+        streamer.ensureLogGroupAndStreamForAccount(
+                "555555555555", "/aws/lambda/example", "2026/09/17/[$LATEST]stream", "us-east-1");
+
+        verify(cloudWatchLogsService).createLogGroupForAccount(
+                "555555555555", "/aws/lambda/example", null, null, "us-east-1");
+        verify(cloudWatchLogsService).createLogStreamForAccount(
+                "555555555555", "/aws/lambda/example", "2026/09/17/[$LATEST]stream", "us-east-1");
+    }
+
+    @Test
+    void streamToCloudWatchLogsForAccountUsesOwningAccount() {
+        CloudWatchLogsService cloudWatchLogsService = mock(CloudWatchLogsService.class);
+        ContainerLogStreamer streamer = new ContainerLogStreamer(null, cloudWatchLogsService);
+
+        streamer.streamToCloudWatchLogsForAccount(
+                "555555555555", "/aws/lambda/example", "stream", "us-east-1", "function output");
+
+        verify(cloudWatchLogsService).putLogEventsForAccount(
+                eq("555555555555"), eq("/aws/lambda/example"), eq("stream"), anyList(), eq("us-east-1"));
+    }
+
+    @Test
+    void execLogCallbackForAccountForwardsExtensionOutputToOwningAccount() {
+        CloudWatchLogsService cloudWatchLogsService = mock(CloudWatchLogsService.class);
+        ContainerLogStreamer streamer = new ContainerLogStreamer(null, cloudWatchLogsService);
+        ResultCallback.Adapter<Frame> callback = streamer.execLogCallbackForAccount(
+                "555555555555", "/aws/lambda/example", "stream", "us-east-1", "lambda:example:extension");
+
+        callback.onNext(new Frame(StreamType.STDOUT, utf8("extension output\n")));
+
+        verify(cloudWatchLogsService).putLogEventsForAccount(
+                eq("555555555555"), eq("/aws/lambda/example"), eq("stream"), anyList(), eq("us-east-1"));
+    }
+
+    @Test
+    void attachedStreamStillReachesCloudWatchAndConsole() {
+        DockerClient dockerClient = mock(DockerClient.class);
+        LogContainerCmd command = mock(LogContainerCmd.class, RETURNS_SELF);
+        when(dockerClient.logContainerCmd("container-1")).thenReturn(command);
+        CloudWatchLogsService cloudWatchLogsService = mock(CloudWatchLogsService.class);
+        ContainerLogStreamer streamer = new ContainerLogStreamer(dockerClient, cloudWatchLogsService);
+
+        streamer.attachForAccount("555555555555", "container-1", "/aws/eks/cluster/cluster",
+                "stream", "us-east-1", "eks:cluster");
+        ArgumentCaptor<ContainerLogStreamer.LogReassemblyCallback> callback =
+                ArgumentCaptor.forClass(ContainerLogStreamer.LogReassemblyCallback.class);
+        verify(command).exec(callback.capture());
+
+        List<LogRecord> records = LogCapture.capture(ContainerLogStreamer.class, () ->
+                callback.getValue().onNext(new Frame(StreamType.STDOUT, utf8("container output\n"))));
+
+        assertEquals(1, records.size());
+        verify(cloudWatchLogsService).putLogEventsForAccount(
+                eq("555555555555"), eq("/aws/eks/cluster/cluster"), eq("stream"),
+                argThat(events ->
+                        events.size() == 1 && "container output".equals(events.getFirst().get("message"))),
+                eq("us-east-1"));
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void execStreamAlwaysReachesCloudWatchAndConsoleIsOptional(boolean logToConsole) {
+        CloudWatchLogsService cloudWatchLogsService = mock(CloudWatchLogsService.class);
+        ContainerLogStreamer streamer = new ContainerLogStreamer(null, cloudWatchLogsService);
+        ResultCallback.Adapter<Frame> callback = logToConsole
+                ? streamer.execLogCallbackForAccount("555555555555", "/aws/eks/cluster/cluster",
+                        "stream", "us-east-1", "eks-audit:cluster")
+                : streamer.execLogCallbackForAccount("555555555555", "/aws/eks/cluster/cluster",
+                        "stream", "us-east-1", "eks-audit:cluster", false);
+
+        List<LogRecord> records = LogCapture.capture(ContainerLogStreamer.class, () ->
+                callback.onNext(new Frame(StreamType.STDOUT, utf8("audit event\n"))));
+
+        assertEquals(logToConsole ? 1 : 0, records.size());
+        verify(cloudWatchLogsService).putLogEventsForAccount(
+                eq("555555555555"), eq("/aws/eks/cluster/cluster"), eq("stream"),
+                argThat(events ->
+                        events.size() == 1 && "audit event".equals(events.getFirst().get("message"))),
+                eq("us-east-1"));
     }
 
     @Test
@@ -324,5 +430,37 @@ class ContainerLogStreamerTest {
             Thread.sleep(5);
         }
         assertEquals(List.of("unterminated-tail"), emitted);
+    }
+
+    private static LogContainerCmd attachWith(java.util.function.BiFunction<ContainerLogStreamer, String, Closeable> attach) {
+        DockerClient dockerClient = mock(DockerClient.class);
+        LogContainerCmd command = mock(LogContainerCmd.class, RETURNS_SELF);
+        when(dockerClient.logContainerCmd("container-1")).thenReturn(command);
+        ContainerLogStreamer streamer = new ContainerLogStreamer(dockerClient, mock(CloudWatchLogsService.class));
+        attach.apply(streamer, "container-1");
+        return command;
+    }
+
+    @Test
+    void attachFollowsTheCompleteHistoryByDefault() {
+        LogContainerCmd command = attachWith((streamer, id) ->
+                streamer.attach(id, "/aws/lambda/fn", "stream", "us-east-1", "lambda:fn"));
+
+        verify(command).withFollowStream(true);
+        verify(command, never()).withSince(anyInt());
+    }
+
+    @Test
+    void attachFromNowOnlyFollowsLinesEmittedAfterAttachment() {
+        long before = Instant.now().getEpochSecond();
+        LogContainerCmd command = attachWith((streamer, id) ->
+                streamer.attachFromNow(id, "/aws/ecr/registry", "stream", "us-east-1", "ecr:registry"));
+        long after = Instant.now().getEpochSecond();
+
+        ArgumentCaptor<Integer> since = ArgumentCaptor.forClass(Integer.class);
+        verify(command).withSince(since.capture());
+        assertTrue(since.getValue() >= before && since.getValue() <= after,
+                "since must be the attach time so an adopted container's history is not replayed");
+        verify(command).withFollowStream(true);
     }
 }

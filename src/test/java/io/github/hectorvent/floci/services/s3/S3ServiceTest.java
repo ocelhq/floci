@@ -17,6 +17,8 @@ import io.github.hectorvent.floci.services.s3.model.WebsiteConfiguration;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -200,6 +202,66 @@ class S3ServiceTest {
         Path filePath = tempDir.resolve("s3/.accounts/000000000000/test-bucket/docs/readme.txt.s3data");
         assertTrue(Files.exists(filePath));
         assertArrayEquals(data, assertDoesNotThrow(() -> Files.readAllBytes(filePath)));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {
+            "..", ".", "../", "a/b", "../victim", ".accounts", ".versions", ".annotations", "a\\b", "   "
+    })
+    void createBucketRejectsANameThatWouldNotStayInsideTheAccountDirectory(String bucketName) {
+        AwsException ex = assertThrows(AwsException.class,
+                () -> s3Service.createBucket(bucketName, "us-east-1"), bucketName);
+        assertEquals("InvalidBucketName", ex.getErrorCode());
+    }
+
+    @Test
+    void objectPathsRefuseABucketNameThatEscapesTheAccountDirectory() {
+        InMemoryStorage<String, Bucket> bucketStore = new InMemoryStorage<>();
+        InMemoryStorage<String, S3Object> objectStore = new InMemoryStorage<>();
+        Path dataRoot = tempDir.resolve("escape-s3");
+        S3Service service = new S3Service(bucketStore, objectStore, dataRoot, false);
+        // Straight into the store, as a bucket persisted before the name was refused would be.
+        bucketStore.put("..", new Bucket(".."));
+
+        AwsException put = assertThrows(AwsException.class, () -> service.putObject(
+                "..", "000000000002/victim-bucket/secret.txt", "stolen".getBytes(StandardCharsets.UTF_8),
+                "text/plain", null));
+
+        assertEquals("InvalidBucketName", put.getErrorCode());
+    }
+
+    @Test
+    void persistedReservedBucketCannotOverwriteAnotherBucketsVersion() {
+        InMemoryStorage<String, Bucket> bucketStore = new InMemoryStorage<>();
+        InMemoryStorage<String, S3Object> objectStore = new InMemoryStorage<>();
+        Path dataRoot = tempDir.resolve("reserved-s3");
+        S3Service service = new S3Service(bucketStore, objectStore, dataRoot, false);
+        byte[] original = "original".getBytes(StandardCharsets.UTF_8);
+
+        service.createBucket("victim-bucket", "us-east-1");
+        service.putBucketVersioning("victim-bucket", "Enabled");
+        S3Object version = service.putObject(
+                "victim-bucket", "document.txt", original, "text/plain", null);
+
+        // Simulate a bucket record persisted before reserved names were rejected.
+        bucketStore.put(".versions", new Bucket(".versions"));
+        String collidingKey = "victim-bucket/document.txt/" + version.getVersionId();
+
+        AwsException put = assertThrows(AwsException.class, () -> service.putObject(
+                ".versions", collidingKey, "tampered".getBytes(StandardCharsets.UTF_8), "text/plain", null));
+
+        assertEquals("InvalidBucketName", put.getErrorCode());
+        assertArrayEquals(original,
+                service.getObject("victim-bucket", "document.txt", version.getVersionId()).getData());
+    }
+
+    @Test
+    void aBucketNamedLikeADotDirectoryStillResolvesInsideTheAccount() {
+        // ".hidden" normalises to a real child, unlike "..".
+        s3Service.createBucket(".hidden", "us-east-1");
+        s3Service.putObject(".hidden", "k.txt", "v".getBytes(StandardCharsets.UTF_8), "text/plain", null);
+
+        assertTrue(Files.exists(tempDir.resolve("s3/.accounts/000000000000/.hidden/k.txt.s3data")));
     }
 
     @Test
@@ -556,6 +618,27 @@ class S3ServiceTest {
         assertNull(lambdaInvoker.functionName);
     }
 
+    @Test
+    void putObjectKeepsTheQualifierOfTheNotificationFunctionArn() {
+        RecordingLambdaInvoker lambdaInvoker = new RecordingLambdaInvoker();
+        RegionResolver regionResolver = new RegionResolver("us-east-1", "000000000000");
+
+        S3Service service = new S3Service(new InMemoryStorage<>(), new InMemoryStorage<>(), tempDir.resolve("notif-s3-alias"),
+                false, lambdaInvoker, regionResolver);
+        service.createBucket("test-bucket", "ap-northeast-1");
+        NotificationConfiguration config = new NotificationConfiguration();
+        config.getLambdaFunctionConfigurations().add(new LambdaNotification(
+                "lambda-notif",
+                "arn:aws:lambda:ap-northeast-1:000000000000:function:s3-notif-test:PROD",
+                List.of("s3:ObjectCreated:Put"),
+                List.of()));
+        service.putBucketNotificationConfiguration("test-bucket", config);
+
+        service.putObject("test-bucket", "a.json", "{}".getBytes(StandardCharsets.UTF_8), "application/json", null);
+
+        assertEquals("s3-notif-test:PROD", lambdaInvoker.functionName);
+    }
+
     private static NotificationConfiguration lambdaNotificationConfig(String prefix, String suffix) {
         NotificationConfiguration config = new NotificationConfiguration();
         config.getLambdaFunctionConfigurations().add(new LambdaNotification(
@@ -656,7 +739,7 @@ class S3ServiceTest {
     // =========================================================================
 
     private static final S3Service.RequestAuthorization UNSIGNED =
-            new S3Service.RequestAuthorization(false, null);
+            new S3Service.RequestAuthorization(false, null, null);
 
     private void websiteBucket(String index, String errorDoc) {
         s3Service.createBucket("site", "us-east-1");
@@ -835,6 +918,59 @@ class S3ServiceTest {
         } finally {
             afterRestart.shutdown();
         }
+    }
+
+    @Test
+    void analyticsAndInventoryConfigurationsOnABucketWithoutAnyBehaveAsEmpty() {
+        // A bucket persisted before these fields existed deserializes with null maps, which is
+        // the same shape a freshly created bucket has, so neither may fault.
+        s3Service.createBucket("no-configs", "us-east-1");
+
+        assertTrue(s3Service.listBucketAnalyticsConfigurations("no-configs")
+                .contains("<IsTruncated>false</IsTruncated>"));
+        assertTrue(s3Service.listBucketInventoryConfigurations("no-configs")
+                .contains("<IsTruncated>false</IsTruncated>"));
+        assertEquals("NoSuchConfiguration", assertThrows(AwsException.class,
+                () -> s3Service.getBucketAnalyticsConfiguration("no-configs", "any")).getErrorCode());
+        assertEquals("NoSuchConfiguration", assertThrows(AwsException.class,
+                () -> s3Service.deleteBucketInventoryConfiguration("no-configs", "any")).getErrorCode());
+
+        // And the first put still lands on it, in its own map.
+        s3Service.putBucketAnalyticsConfiguration("no-configs", "first", "<Id>first</Id>");
+        s3Service.putBucketInventoryConfiguration("no-configs", "first", "<Id>first</Id>");
+        assertTrue(s3Service.getBucketAnalyticsConfiguration("no-configs", "first")
+                .contains("<AnalyticsConfiguration"));
+        assertTrue(s3Service.getBucketInventoryConfiguration("no-configs", "first")
+                .contains("<InventoryConfiguration"));
+        assertEquals("NoSuchConfiguration", assertThrows(AwsException.class,
+                () -> s3Service.getBucketMetricsConfiguration("no-configs", "first")).getErrorCode());
+    }
+
+    @Test
+    void analyticsAndInventoryConfigurationsDoNotOutliveTheirBucket() {
+        s3Service.createBucket("recycled-configs", "us-east-1");
+        s3Service.putBucketAnalyticsConfiguration("recycled-configs", "old", "<Id>old</Id>");
+        s3Service.putBucketInventoryConfiguration("recycled-configs", "old", "<Id>old</Id>");
+        s3Service.deleteBucket("recycled-configs");
+
+        s3Service.createBucket("recycled-configs", "us-east-1");
+
+        assertEquals("NoSuchConfiguration", assertThrows(AwsException.class,
+                () -> s3Service.getBucketAnalyticsConfiguration("recycled-configs", "old")).getErrorCode());
+        assertEquals("NoSuchConfiguration", assertThrows(AwsException.class,
+                () -> s3Service.getBucketInventoryConfiguration("recycled-configs", "old")).getErrorCode());
+    }
+
+    @Test
+    void analyticsAndInventoryConfigurationsSurviveAJacksonRoundTrip() throws Exception {
+        var mapper = new com.fasterxml.jackson.databind.ObjectMapper().findAndRegisterModules();
+        Bucket bucket = new Bucket("persisted-configs");
+        bucket.setAnalyticsConfigurations(new java.util.LinkedHashMap<>(Map.of("a", "<Id>a</Id>")));
+        bucket.setInventoryConfigurations(new java.util.LinkedHashMap<>(Map.of("i", "<Id>i</Id>")));
+
+        Bucket reloaded = mapper.readValue(mapper.writeValueAsString(bucket), Bucket.class);
+        assertEquals("<Id>a</Id>", reloaded.getAnalyticsConfigurations().get("a"));
+        assertEquals("<Id>i</Id>", reloaded.getInventoryConfigurations().get("i"));
     }
 
     @Test
@@ -1169,5 +1305,24 @@ class S3ServiceTest {
         s3Service.createBucket("anon-del-bucket", "us-east-1");
         assertDoesNotThrow(() -> s3Service.authorizeAnonymousDeleteObject("anon-del-bucket", "some/key"));
     }
-}
 
+    @Test
+    void authorizeSignedGetObjectIsANoOpWhenEnforceAuthIsOff() {
+        assertDoesNotThrow(() -> s3Service.authorizeSignedGetObject("ASIAFAKEKEY00000001", "sessiontoken", "signed-get-bucket", "some/key"));
+    }
+
+    @Test
+    void authorizeSignedPutObjectIsANoOpWhenEnforceAuthIsOff() {
+        assertDoesNotThrow(() -> s3Service.authorizeSignedPutObject("ASIAFAKEKEY00000001", "sessiontoken", "signed-put-bucket", "some/key"));
+    }
+
+    @Test
+    void authorizeSignedListBucketIsANoOpWhenEnforceAuthIsOff() {
+        assertDoesNotThrow(() -> s3Service.authorizeSignedListBucket("ASIAFAKEKEY00000001", "sessiontoken", "signed-list-bucket"));
+    }
+
+    @Test
+    void authorizeSignedDeleteObjectIsANoOpWhenEnforceAuthIsOff() {
+        assertDoesNotThrow(() -> s3Service.authorizeSignedDeleteObject("ASIAFAKEKEY00000001", "sessiontoken", "signed-del-bucket", "some/key"));
+    }
+}

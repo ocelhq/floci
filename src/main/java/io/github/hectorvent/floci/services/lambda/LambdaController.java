@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.lambda;
 
+import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.services.lambda.model.EventSourceMapping;
@@ -120,6 +121,12 @@ public class LambdaController {
         if (tags != null && !tags.isEmpty()) {
             ObjectNode tagsNode = root.putObject("Tags");
             tags.forEach(tagsNode::put);
+        }
+
+        Integer reservedConcurrency = fn.getReservedConcurrentExecutions();
+        String effectiveQualifier = LambdaArnUtils.resolveWithQualifier(functionName, qualifier).qualifier();
+        if (effectiveQualifier == null && reservedConcurrency != null) {
+            root.putObject("Concurrency").put("ReservedConcurrentExecutions", reservedConcurrency);
         }
 
         return Response.ok(root).build();
@@ -308,8 +315,9 @@ public class LambdaController {
 
     @GET
     @Path("/event-source-mappings")
-    public Response listEventSourceMappings(@QueryParam("FunctionName") String functionArn) {
-        List<EventSourceMapping> esms = lambdaService.listEventSourceMappings(functionArn);
+    public Response listEventSourceMappings(@QueryParam("FunctionName") String functionArn,
+                                            @QueryParam("EventSourceArn") String eventSourceArn) {
+        List<EventSourceMapping> esms = lambdaService.listEventSourceMappings(functionArn, eventSourceArn);
         ObjectNode root = objectMapper.createObjectNode();
         ArrayNode items = root.putArray("EventSourceMappings");
         for (EventSourceMapping esm : esms) {
@@ -344,11 +352,16 @@ public class LambdaController {
     Map<String, Object> buildEsmResponse(EventSourceMapping esm) {
         ObjectNode node = objectMapper.createObjectNode();
         node.put("UUID", esm.getUuid());
+        node.put("EventSourceMappingArn",
+                LambdaArnUtils.eventSourceMappingArn(esm.getRegion(), esm.getAccountId(), esm.getUuid()));
         node.put("FunctionArn", esm.getFunctionArn());
         if (esm.getEventSourceArn() != null) {
             node.put("EventSourceArn", esm.getEventSourceArn());
         }
         node.put("BatchSize", esm.getBatchSize());
+        if (esm.getMaximumBatchingWindowInSeconds() != null) {
+            node.put("MaximumBatchingWindowInSeconds", esm.getMaximumBatchingWindowInSeconds());
+        }
         node.put("State", esm.getState());
         node.put("LastModified", (double) esm.getLastModified() / 1000.0);
         // Omitted rather than nulled when unset, so a mapping created without a starting position
@@ -364,6 +377,13 @@ public class LambdaController {
 
         if (esm.getBisectBatchOnFunctionError() != null) {
             node.put("BisectBatchOnFunctionError", esm.getBisectBatchOnFunctionError());
+        }
+
+        if (esm.getMaximumRetryAttempts() != null) {
+            node.put("MaximumRetryAttempts", esm.getMaximumRetryAttempts());
+        }
+        if (esm.getMaximumRecordAgeInSeconds() != null) {
+            node.put("MaximumRecordAgeInSeconds", esm.getMaximumRecordAgeInSeconds());
         }
 
         if (esm.getDestinationConfig() != null && esm.getDestinationConfig().getOnFailure() != null) {
@@ -816,13 +836,13 @@ public class LambdaController {
                 .put("RuntimeVersionArn", runtimeVersionArn(fn));
     }
 
-    private static String runtimeVersionArn(LambdaFunction fn) {
-        String region = "us-east-1";
+    private String runtimeVersionArn(LambdaFunction fn) {
+        String region = regionResolver.getDefaultRegion();
         String[] arnParts = fn.getFunctionArn() != null ? fn.getFunctionArn().split(":") : new String[0];
         if (arnParts.length > 3 && !arnParts[3].isBlank()) {
             region = arnParts[3];
         }
-        return "arn:aws:lambda:" + region + "::runtime:" + runtimeVersionId(fn.getRuntime());
+        return AwsArnUtils.Arn.of("lambda", region, "", "runtime:" + runtimeVersionId(fn.getRuntime())).toString();
     }
 
     /**

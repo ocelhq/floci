@@ -22,6 +22,7 @@ public class EventSourceMapping {
     private String region;
     private boolean enabled = true;
     private int batchSize = 10;
+    private Integer maximumBatchingWindowInSeconds;
     private String state = "Enabled";
     private long lastModified;
     private String startingPosition;
@@ -30,11 +31,14 @@ public class EventSourceMapping {
     private Map<String, String> shardSequenceNumbers = new HashMap<>();
     private ScalingConfig scalingConfig;
     private Boolean bisectBatchOnFunctionError;
+    private Integer maximumRetryAttempts;
+    private Integer maximumRecordAgeInSeconds;
     private DestinationConfig destinationConfig;
     private FilterCriteria filterCriteria;
     private Map<String, Object> selfManagedEventSource;
     private List<String> topics = new ArrayList<>();
     private List<Map<String, Object>> sourceAccessConfigurations = new ArrayList<>();
+    private Map<String, String> tags = new HashMap<>();
 
     public EventSourceMapping() {
     }
@@ -66,6 +70,12 @@ public class EventSourceMapping {
     public int getBatchSize() { return batchSize; }
     public void setBatchSize(int batchSize) { this.batchSize = batchSize; }
 
+    /** Seconds to accumulate an underfilled batch before invoking; {@code null} or 0 means invoke as soon as messages arrive. */
+    public Integer getMaximumBatchingWindowInSeconds() { return maximumBatchingWindowInSeconds; }
+    public void setMaximumBatchingWindowInSeconds(Integer maximumBatchingWindowInSeconds) {
+        this.maximumBatchingWindowInSeconds = maximumBatchingWindowInSeconds;
+    }
+
     public String getState() { return state; }
     public void setState(String state) { this.state = state; }
 
@@ -92,7 +102,7 @@ public class EventSourceMapping {
 
     public Map<String, String> getShardSequenceNumbers() { return shardSequenceNumbers; }
     public void setShardSequenceNumbers(Map<String, String> shardSequenceNumbers) {
-        this.shardSequenceNumbers = shardSequenceNumbers != null ? shardSequenceNumbers : new java.util.HashMap<>();
+        this.shardSequenceNumbers = shardSequenceNumbers != null ? shardSequenceNumbers : new HashMap<>();
     }
 
     public ScalingConfig getScalingConfig() { return scalingConfig; }
@@ -109,6 +119,22 @@ public class EventSourceMapping {
 
     public void setBisectBatchOnFunctionError(Boolean bisectBatchOnFunctionError) {
         this.bisectBatchOnFunctionError = bisectBatchOnFunctionError;
+    }
+
+    public Integer getMaximumRetryAttempts() {
+        return maximumRetryAttempts;
+    }
+
+    public void setMaximumRetryAttempts(Integer maximumRetryAttempts) {
+        this.maximumRetryAttempts = maximumRetryAttempts;
+    }
+
+    public Integer getMaximumRecordAgeInSeconds() {
+        return maximumRecordAgeInSeconds;
+    }
+
+    public void setMaximumRecordAgeInSeconds(Integer maximumRecordAgeInSeconds) {
+        this.maximumRecordAgeInSeconds = maximumRecordAgeInSeconds;
     }
 
     public DestinationConfig getDestinationConfig() {
@@ -149,6 +175,14 @@ public class EventSourceMapping {
 
     public void setSourceAccessConfigurations(List<Map<String, Object>> sourceAccessConfigurations) {
         this.sourceAccessConfigurations = sourceAccessConfigurations != null ? sourceAccessConfigurations : new ArrayList<>();
+    }
+
+    public Map<String, String> getTags() {
+        return tags;
+    }
+
+    public void setTags(Map<String, String> tags) {
+        this.tags = tags != null ? tags : new HashMap<>();
     }
 
     @RegisterForReflection

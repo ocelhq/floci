@@ -4,6 +4,7 @@ import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.ResolvedServiceCatalog;
 import io.github.hectorvent.floci.core.common.ServiceDescriptor;
 import io.github.hectorvent.floci.core.common.ServiceProtocol;
+import io.github.hectorvent.floci.testutil.LogCapture;
 import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.DisabledOnOs;
@@ -18,6 +19,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Set;
+import java.util.logging.LogRecord;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -110,5 +112,38 @@ class PersistentPathValidatorTest {
         when(catalog.all()).thenReturn(List.of(descriptor("s3", false, "s3", "hybrid")));
 
         validator().validateAtBoot();
+    }
+
+    @Test
+    void memoryModeLogsThatStateIsNotPersisted() {
+        when(catalog.all()).thenReturn(List.of(
+                descriptor("s3", true, "s3", "memory"),
+                descriptor("sqs", true, "sqs", "memory")));
+
+        List<LogRecord> records = LogCapture.capture(PersistentPathValidator.class,
+                () -> validator().validateAtBoot());
+
+        assertTrue(records.stream().anyMatch(r -> r.getMessage() != null
+                        && r.getMessage().contains("memory")
+                        && r.getMessage().contains("NOT persisted")),
+                "expected a boot log announcing memory mode, got: " + records);
+    }
+
+    @Test
+    void hybridModeLogsThatStateIsPersisted() {
+        Path root = tempDir.resolve("data");
+        when(catalog.all()).thenReturn(List.of(descriptor("sqs", true, "sqs", "hybrid")));
+        when(storageConfig.persistentPath()).thenReturn(root.toString());
+
+        List<LogRecord> records = LogCapture.capture(PersistentPathValidator.class,
+                () -> validator().validateAtBoot());
+
+        assertTrue(records.stream().anyMatch(r -> r.getMessage() != null
+                        && r.getMessage().contains("persistent")
+                        && r.getParameters() != null
+                        && r.getParameters().length == 2
+                        && String.valueOf(r.getParameters()[0]).contains("sqs=hybrid")
+                        && String.valueOf(r.getParameters()[1]).contains(root.toString())),
+                "expected a boot log announcing persistent mode with the effective path, got: " + records);
     }
 }

@@ -2,10 +2,18 @@ package io.github.hectorvent.floci.services.eks;
 
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.response.Response;
+import io.restassured.response.ValidatableResponse;
 import org.junit.jupiter.api.MethodOrderer;
 import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestMethodOrder;
+
+import java.nio.charset.StandardCharsets;
+import java.security.KeyFactory;
+import java.security.PrivateKey;
+import java.security.Signature;
+import java.security.spec.PKCS8EncodedKeySpec;
+import java.util.Base64;
 
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.containsString;
@@ -18,7 +26,7 @@ import static org.hamcrest.Matchers.notNullValue;
  * it via {@code sts:AssumeRoleWithWebIdentity}.
  *
  * <p>Also covers the negative cases that matter — wrong service account, tampered signature, wrong
- * audience — and the compatibility guarantee that an opaque third-party token is still accepted.
+ * audience, and the compatibility guarantee that an opaque third-party token is still accepted.
  */
 @QuarkusTest
 @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
@@ -34,6 +42,12 @@ class EksIrsaEndToEndIntegrationTest {
 
     private static String issuer;
     private static String roleArn;
+
+    private final EksOidcService oidcService;
+
+    EksIrsaEndToEndIntegrationTest(EksOidcService oidcService) {
+        this.oidcService = oidcService;
+    }
 
     private static String issuerKeyPrefix() {
         return issuer.replaceFirst("^https://", "");
@@ -96,6 +110,17 @@ class EksIrsaEndToEndIntegrationTest {
             .extract().path("token");
     }
 
+    private PrivateKey clusterSigningKey() throws Exception {
+        String encoded = oidcService.ensureKey(CLUSTER, issuer).getPrivateKey();
+        return KeyFactory.getInstance("RSA")
+                .generatePrivate(new PKCS8EncodedKeySpec(Base64.getDecoder().decode(encoded)));
+    }
+
+    private static String base64Url(String value) {
+        return Base64.getUrlEncoder().withoutPadding()
+                .encodeToString(value.getBytes(StandardCharsets.UTF_8));
+    }
+
     private Response assumeRole(String token) {
         return given()
             .contentType(FORM)
@@ -110,11 +135,10 @@ class EksIrsaEndToEndIntegrationTest {
 
     @Test
     @Order(3)
-    void mintedTokenAssumesRoleAndReturnsRealClaims() {
+    void mintedTokenAssumesRoleAndPreservesCallerIdentity() {
         String token = mintToken(NAMESPACE, SERVICE_ACCOUNT, null);
 
-        assumeRole(token)
-        .then()
+        ValidatableResponse assumed = assumeRole(token).then()
             .statusCode(200)
             .body(containsString("<AccessKeyId>ASIA"))
             .body(containsString("<SecretAccessKey>"))
@@ -124,6 +148,21 @@ class EksIrsaEndToEndIntegrationTest {
                     + NAMESPACE + ":" + SERVICE_ACCOUNT + "</SubjectFromWebIdentityToken>"))
             .body(containsString("<Provider>" + issuer + "</Provider>"))
             .body(containsString("<Audience>sts.amazonaws.com</Audience>"));
+
+        String prefix = "AssumeRoleWithWebIdentityResponse.AssumeRoleWithWebIdentityResult.";
+        String accessKeyId = assumed.extract().path(prefix + "Credentials.AccessKeyId");
+        String sessionToken = assumed.extract().path(prefix + "Credentials.SessionToken");
+        String assumedRoleArn = assumed.extract().path(prefix + "AssumedRoleUser.Arn");
+        String assumedRoleId = assumed.extract().path(prefix + "AssumedRoleUser.AssumedRoleId");
+        given()
+            .contentType(FORM)
+            .formParam("Action", "GetCallerIdentity")
+            .header("Authorization", "AWS4-HMAC-SHA256 Credential=" + accessKeyId
+                    + "/20260926/us-east-1/sts/aws4_request")
+            .header("X-Amz-Security-Token", sessionToken)
+        .when().post("/").then().statusCode(200)
+            .body("GetCallerIdentityResponse.GetCallerIdentityResult.Arn", equalTo(assumedRoleArn))
+            .body("GetCallerIdentityResponse.GetCallerIdentityResult.UserId", equalTo(assumedRoleId));
     }
 
     @Test
@@ -184,6 +223,29 @@ class EksIrsaEndToEndIntegrationTest {
 
     @Test
     @Order(8)
+    void expiredTokenReturnsExpiredTokenException() throws Exception {
+        // Signed with the cluster's own key so signature, issuer, and audience all pass and only the
+        // expiry can reject it. STS reports that case as ExpiredTokenException, distinct from the
+        // InvalidIdentityToken a caller cannot recover from by fetching a fresh token.
+        long expired = System.currentTimeMillis() / 1000 - 7200;
+        String header = base64Url("{\"alg\":\"RS256\",\"typ\":\"JWT\"}");
+        String payload = base64Url("{\"iss\":\"" + issuer + "\",\"aud\":[\"sts.amazonaws.com\"],"
+                + "\"sub\":\"system:serviceaccount:" + NAMESPACE + ":" + SERVICE_ACCOUNT + "\","
+                + "\"exp\":" + expired + "}");
+        Signature signature = Signature.getInstance("SHA256withRSA");
+        signature.initSign(clusterSigningKey());
+        signature.update((header + "." + payload).getBytes(StandardCharsets.UTF_8));
+        String token = header + "." + payload + "."
+                + Base64.getUrlEncoder().withoutPadding().encodeToString(signature.sign());
+
+        assumeRole(token)
+        .then()
+            .statusCode(400)
+            .body(containsString("<Code>ExpiredTokenException</Code>"));
+    }
+
+    @Test
+    @Order(9)
     void opaqueThirdPartyTokenRemainsAccepted() {
         // Compatibility guarantee: Floci cannot adjudicate an issuer it does not host, so the
         // historical permissive behaviour is preserved rather than failing the call.
@@ -195,7 +257,7 @@ class EksIrsaEndToEndIntegrationTest {
     }
 
     @Test
-    @Order(9)
+    @Order(10)
     void jwksAndDiscoveryEndpointsServeTheSigningKey() {
         given()
         .when()
@@ -217,7 +279,7 @@ class EksIrsaEndToEndIntegrationTest {
     }
 
     @Test
-    @Order(10)
+    @Order(11)
     void mintRejectsMissingServiceAccount() {
         given()
             .contentType(JSON)
@@ -229,7 +291,7 @@ class EksIrsaEndToEndIntegrationTest {
     }
 
     @Test
-    @Order(11)
+    @Order(12)
     void mintRejectsUnknownCluster() {
         given()
             .contentType(JSON)
@@ -241,7 +303,7 @@ class EksIrsaEndToEndIntegrationTest {
     }
 
     @Test
-    @Order(12)
+    @Order(13)
     void deletingClusterDropsSigningKey() {
         given().when().delete("/clusters/" + CLUSTER).then().statusCode(200);
 

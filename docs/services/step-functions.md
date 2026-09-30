@@ -16,6 +16,11 @@
 | `PublishStateMachineVersion` | - |
 | `ListStateMachineVersions` | - |
 | `DeleteStateMachineVersion` | - |
+| `CreateStateMachineAlias` | - |
+| `DescribeStateMachineAlias` | - |
+| `ListStateMachineAliases` | - |
+| `UpdateStateMachineAlias` | - |
+| `DeleteStateMachineAlias` | - |
 | `ValidateStateMachineDefinition` | Validate an ASL definition without creating a state machine |
 | `StartExecution` | Start a new execution |
 | `StartSyncExecution` | - |
@@ -62,9 +67,37 @@ A `Retry` re-entry emits its own Scheduled, Started, and Failed triple for each 
 mocked Task (`SFN_MOCK_CONFIG`) emits the same events as a real one, because Step Functions
 Local does the same.
 
-Every event's `previousEventId` points to the id of the event right before it. The one
-exception is the first state's `*StateEntered` event. Its `previousEventId` is `0`. That
-matches `ExecutionStarted`, which is always `id: 1, previousEventId: 0`.
+Every event's `previousEventId` points to the id of the event right before it on the same
+chain of states. The one exception is the first state's `*StateEntered` event. Its
+`previousEventId` is `0`. That matches `ExecutionStarted`, which is always
+`id: 1, previousEventId: 0`.
+
+### Parallel branches and Map iterations
+
+The states inside a `Parallel` branch or an inline `Map` iteration publish their events into
+the parent execution's history, as on AWS. A `Parallel` records `ParallelStateStarted`,
+`ParallelStateSucceeded` and `ParallelStateFailed`. An inline `Map` records `MapStateStarted`,
+`MapIterationStarted`, `MapIterationSucceeded`, `MapIterationFailed`, `MapStateSucceeded` and
+`MapStateFailed`. A Distributed `Map` records `MapRunStarted`, `MapRunSucceeded` and
+`MapRunFailed` instead. Its items are child executions and publish nothing into the parent
+history. A `Task` whose failure ends its branch also records `TaskStateAborted`. When a failure
+ends a `Parallel`, each other branch that is still inside a `Task` or a `Wait` records
+`TaskStateAborted` or `WaitStateAborted`, chained to the failing branch's last event and recorded
+before `ParallelStateFailed`.
+
+Branches and iterations run concurrently, so the order in which their events interleave differs
+from run to run. Each branch chains its own events through `previousEventId`, and that chain is
+the same every time.
+
+### The cause of a failure
+
+The `cause` of a failure the interpreter raises starts with
+`An error occurred while executing the state '<name>' (entered at the event id #<n>). `, as on
+AWS. The prefix is added once, at the innermost state. A `Fail` state's `Cause` and a cause a
+task's resource answered with pass through unchanged. A `Choice` that matches no rule and has
+no `Default`, and a payload template path that matches nothing, fail with `States.Runtime`.
+A JSONata expression that fails also records an `EvaluationFailed` event with `error`, `cause`,
+`location` and `state`, once per attempt.
 
 `inputDetails` appears on `ExecutionStarted`, on `stateEnteredEventDetails`, and on
 `LambdaFunctionScheduled`/`ActivityScheduled`. `outputDetails` appears on
@@ -76,9 +109,13 @@ When the request sets `includeExecutionData` to false, the details objects stay 
 `taskScheduledEventDetails.parameters`. This matches AWS.
 
 A few gaps remain. `TaskStarted`, `LambdaFunctionStarted`, and `ActivityStarted` fire at
-scheduling time, not when a worker actually picks up the task. Events inside a `Parallel` or
-`Map` branch are not recorded in the parent execution's history. `TaskSubmitted`, which real
-AWS emits for `.sync` and `.waitForTaskToken` integrations, is not emitted yet.
+scheduling time, not when a worker actually picks up the task. `TaskSubmitted`, which real
+AWS emits for `.sync` and `.waitForTaskToken` integrations, is not emitted yet. When a
+branch fails, AWS records `*StateAborted` and `MapIterationAborted` events for the states its
+sibling branches were in; Floci cancels the siblings without recording them. A Distributed
+`Map` that declares no tolerance reports a failed item's own error rather than AWS's
+`States.ExceedToleratedFailureThreshold`, and emits `MapRunFailed` with that error. A `Map` that
+declares one reports `States.ExceedToleratedFailureThreshold`, as AWS does.
 
 ## Map concurrency
 
@@ -90,6 +127,77 @@ omitted value, uses the AWS service ceiling: 40 concurrent iterations for Inline
 Results remain in input order even when iterations finish out of order. If an iteration fails,
 the Map state fails promptly, cancels its active sibling iterations, and does not start queued
 iterations.
+
+## Distributed Map ItemReader
+
+`ItemReader` reads a dataset from S3. The resource decides how the dataset is found, and
+`ReaderConfig.InputType` decides how it is read.
+
+`arn:aws:states:::s3:getObject` reads a single object:
+
+- `JSON` is either an array, or an object whose entries become `Key` and `Value` items.
+  `ReaderConfig.ItemsPointer` selects a node inside it.
+- `JSONL` is one item per line. Blank lines are skipped, and `ItemsPointer` does not apply,
+  matching AWS.
+- `CSV` takes its field names from the first row, or from `ReaderConfig.CSVHeaders` when
+  `CSVHeaderLocation` is `GIVEN`. Every value is a string: a row shorter than the headers pads
+  with empty strings, and a longer one drops the surplus. `ReaderConfig.CSVDelimiter` selects
+  `COMMA`, `PIPE`, `SEMICOLON`, `SPACE` or `TAB`, and a quoted field may contain the delimiter
+  or a line break without ending the record. A doubled quote stands for a single quote, in an
+  unquoted field as well as a quoted one, and a backslash escapes another backslash, a quote or
+  the delimiter. A backslash before anything else is dropped, as AWS documents.
+- `PARQUET` and `MANIFEST` are accepted by `CreateStateMachine` and fail the execution with
+  `States.ItemReaderFailed`.
+
+`arn:aws:states:::s3:listObjectsV2` reads every page under `Prefix`. Each item carries the AWS
+fields `Etag`, `Key`, `LastModified` (epoch seconds), `Size` and `StorageClass`. An empty prefix
+gives zero iterations and the Map succeeds.
+
+`ReaderConfig.MaxItems` applies to every reader. Literal values cannot exceed 100,000,000; a
+larger value resolved by `MaxItemsPath` or a JSONata expression is capped at that reader limit.
+A dynamic limit resolving to zero reads the entire dataset.
+`MaxItemsPath` accepts integers and integer strings within the signed 64-bit range. Values
+outside that range or decimal values fail with `States.Runtime`; negative integers fail with
+`States.ItemReaderFailed`. JSONata expressions must return integers, not strings.
+JSONPath state machines may resolve the limit from the Map input with `MaxItemsPath`, while
+JSONata state machines may use a `{% %}` expression in `MaxItems`. `MaxItems` and `MaxItemsPath`
+are mutually exclusive, and `MaxItemsPath` is rejected for JSONata state machines.
+
+## Distributed Map ItemBatcher
+
+`ItemBatcher` hands each child execution a batch of items instead of a single item. The child input
+is `{"BatchInput": ..., "Items": [...]}`, with `BatchInput` present only when the state declares it.
+`ItemSelector` still runs per item, before the items are grouped.
+
+A batch closes on `MaxItemsPerBatch`, on `MaxInputBytesPerBatch`, or on the 256 KiB child-input
+ceiling AWS applies whether or not a byte limit is declared. Either limit may be given as a
+`...Path` field, or as an expression in a JSONata state machine. With neither declared, items fill
+one batch up to that ceiling. The size measured is the serialized child payload, envelope and
+`BatchInput` included, not the items alone. An item that would exceed the ceiling on its own can
+never start a child execution, so the state fails with `States.DataLimitExceeded` rather than
+building a batch AWS would reject: reduce the item with `ItemSelector` first.
+
+`MaxConcurrency` then bounds concurrent batches, and the Map result has one entry per batch rather
+than per item. `DescribeMapRun` reports items under `itemCounts` and batches under
+`executionCounts`.
+
+## Tolerated failures
+
+`ToleratedFailureCount` and `ToleratedFailurePercentage` let a Distributed `Map` absorb failed items
+instead of failing on the first one. Both accept a `...Path` field, or an expression in a JSONata
+state machine, and the percentage is taken over the item count. Declaring both applies the stricter
+of the two.
+
+An absorbed failure contributes no result, so the `Map` output carries one entry per successful
+child execution. A `ResultWriter` still exports it: successful children go to `SUCCEEDED_0.json` and
+absorbed failures to `FAILED_0.json`, each listed under the matching key of the manifest's
+`ResultFiles`. A failed record carries `Error` and `Cause` in place of an output. Once the budget is
+spent, the state fails with `States.ExceedToleratedFailureThreshold` and the run emits
+`MapRunFailed`.
+
+`DescribeMapRun` reports the declared values under `toleratedFailureCount` and
+`toleratedFailurePercentage`. A `Map` that declares neither keeps the earlier behaviour: the first
+failed item fails the state, carrying that item's own error.
 
 ## Retry policies
 
@@ -108,15 +216,27 @@ workflows converge: the `framework-isComplete-task` throws on every not-yet-comp
 
 `JitterStrategy` supports `NONE` (the default) and `FULL`. `FULL` draws the delay
 uniformly between zero and the computed delay, as on AWS. One deviation. The delay
-between attempts is capped at 30 seconds, the same cap Floci applies to `Wait` states,
-so emulated runs stay fast.
+between attempts is capped at `floci.services.stepfunctions.max-wait-seconds`
+(default 30), the same ceiling Floci applies to `Wait` states, so emulated runs stay fast.
+
+## Wait states
+
+A `Wait` state honors `Seconds`, `SecondsPath`, `Timestamp`, and `TimestampPath`. The two
+`Seconds` forms pause for the given number of seconds. The two `Timestamp` forms parse an
+ISO-8601 instant and pause until it, or return promptly when it has already passed. An
+unparseable timestamp fails the execution with `States.Runtime`. In a JSONata state machine,
+`Seconds` and `Timestamp` each accept a literal or a JSONata expression that produces the value.
+
+One deviation. Every pause is capped at `floci.services.stepfunctions.max-wait-seconds`
+(default 30) so emulated runs stay fast, where AWS sleeps the full duration.
 
 ## Timeouts
 
 ASL carries two `TimeoutSeconds` fields and Floci enforces both, in the two terminal shapes
-AWS uses. The state machine's own field bounds every state; a `Task`'s own field only bounds
-one that waits for a task token — an activity, or a `.waitForTaskToken` integration. A Lambda
-or other SDK task that returns directly is not bound by it.
+AWS uses. The state machine's own field bounds every state; a `Task`'s own field bounds one that
+waits: for a task token (an activity, or a `.waitForTaskToken` integration) or for a job to end
+(`ecs:runTask.sync`, `states:startExecution.sync` and `.sync:2`). A Lambda or other SDK task that
+returns directly is not bound by it.
 
 The state machine's own `TimeoutSeconds` is the whole execution's budget. It is checked before
 every state and inside a `Wait`, so a `Wait` longer than what is left is cut rather than slept
@@ -137,6 +257,17 @@ reads `FAILED` with that same error. A `Catch` on a heartbeat expiry matches und
 `DescribeExecution` and the `ExecutionFailed` event both leave the key out, where every other
 failure reports one. A `Task` that declares no `TimeoutSeconds` waits 300 seconds, where AWS
 waits a year.
+
+A `Task` that waits for a `.sync` job runs under the same two clocks and no other: the execution's
+budget ends it `TIMED_OUT`, its own `TimeoutSeconds` ends it `FAILED` with a `TaskTimedOut` event
+carrying `States.Timeout` and no cause, and a job that takes longer than either simply runs until
+the earlier clock fires. The default of 300 seconds applies here too when the state declares none.
+When the `Task`'s own clock fires, the job it was waiting on is stopped the way AWS stops it: the
+ECS task reads `stopCode: UserInitiated`, the child execution reads `ABORTED` with no error, and
+both carry the cause `The Task state in AWS Step Functions execution [<arn>] which was managing
+this resource was aborted`. A `StopExecution` that lands while the state waits ends the wait and
+stops the job with the same cause, and so does the execution's budget, and a failure in another
+`Parallel` branch that cuts the branch the `Task` is in.
 
 One deviation. AWS starts the `TimeoutSeconds` clock when a worker picks the task up, the instant
 it emits `ActivityStarted`. Floci emits `ActivityStarted` at schedule time, so both clocks start
@@ -187,9 +318,8 @@ index: `Output`, `Output/a/b[0]`, `Assign/x`, `Arguments/MessageGroupId`, `Choic
 `Choices[1]/Output/v`, `Choices[0]/Assign/x`, `Catch[1]/Output/v`. A `Choice` stops at the first rule
 that matches, so an undefined condition in a later rule is never evaluated.
 
-One deviation. AWS prefixes the cause of a real execution with
-`An error occurred while executing the state '<name>' (entered at the event id #<n>).`; Floci
-returns the cause without it, which is the form AWS's own `TestState` returns.
+The cause of a real execution carries the state prefix described under
+[The cause of a failure](#the-cause-of-a-failure).
 
 ## JSONata functions
 
@@ -302,6 +432,17 @@ integrations, and only the casing of the result tells them apart.
 SDK call itself succeeded, so the task result carries `Status`, `Error` and `Cause` and the parent
 decides what to do next.
 
+The two `.sync` modes fail the calling task with `States.TaskFailed` however the child ended
+(`FAILED`, `TIMED_OUT` or `ABORTED`) and whatever its own error was, `States.Timeout` included, so
+a `Catch` on the child's own error name never takes it. The cause is the child's `DescribeExecution`
+response as JSON, PascalCase with its keys in alphabetical order: `Cause` and `Error` when the
+child has them, then `ExecutionArn`, `Input`, `InputDetails`, `Name`, `RedriveCount`,
+`RedriveStatus`, `StartDate`, `StateMachineArn`, `Status` and `StopDate`, with dates in epoch
+milliseconds and no `Output`. A child started through an alias also carries `StateMachineAliasArn`
+and `StateMachineVersionArn`, and one started through a version carries `StateMachineVersionArn`,
+each in its alphabetical place. A parent that needs the child's error reads it from there, for
+example with `States.StringToJson($.Cause)` after a `Catch`.
+
 A `Name` a Standard child already used fails the calling task with the child's collision error, named
 for the integration that raised it: `StepFunctions.ExecutionAlreadyExistsException` through
 `states:startExecution` in any of its modes, and `Sfn.ExecutionAlreadyExistsException` through
@@ -328,12 +469,54 @@ the wire and the task fails with `Sfn.StateMachineDoesNotExistException`.
 | `arn:aws:states:::aws-sdk:sfn:startSyncExecution` | execution envelope | `Sfn.StateMachineTypeNotSupportedException` for a Standard child |
 | `arn:aws:states:::aws-sdk:sfn:sendTaskSuccess` | `{}` | `Sfn.InvalidTokenException` when no task is waiting on the token |
 | `arn:aws:states:::aws-sdk:sfn:sendTaskFailure` | `{}` | `Sfn.InvalidTokenException` |
+| `arn:aws:states:::aws-sdk:rdsdata:executeStatement` | RDS Data statement result | `RdsData.BadRequestException` for an invalid request |
 | `arn:aws:states:::aws-sdk:scheduler:createSchedule` | `{ScheduleArn}` | `Scheduler.ConflictException` when the name is taken |
 | `arn:aws:states:::aws-sdk:scheduler:updateSchedule` | `{ScheduleArn}` | `Scheduler.ResourceNotFoundException` |
+| `arn:aws:states:::aws-sdk:scheduler:deleteSchedule` | `{}` | `Scheduler.ResourceNotFoundException` |
+| `arn:aws:states:::aws-sdk:sns:publish` | `{MessageId}` | `Sns.NotFoundException` when the topic does not exist |
+
+Scheduler create and update tasks accept `StartDate` and `EndDate` as RFC 3339 strings, including
+offsets and fractional seconds. The direct Scheduler API continues to use numeric epoch seconds.
+Structured JSON values supplied as `Target.Input` are serialized once to the Scheduler API's string
+field. Textual JSON remains unchanged, and malformed text reaches the existing Scheduler validation.
 
 `sendTaskSuccess` and `sendTaskFailure` resolve a token a `.waitForTaskToken` task is parked on. A
 token nobody is waiting for fails the calling task rather than reporting a delivery that never
 happened.
+
+`rdsdata:executeStatement` uses the existing RDS Data API implementation. Task arguments use SDK
+PascalCase names such as `ResourceArn`, `SecretArn`, `Sql` and `Parameters`; the adapter translates
+them to the direct API shape and returns a recursively PascalCase result. Other RDS Data actions are
+not routed through Step Functions yet.
+
+## Publishing to SNS
+
+`arn:aws:states:::sns:publish` calls the SNS Publish API with the task's parameters and returns the
+Publish response, `{MessageId}`. `TopicArn`, `TargetArn`, `PhoneNumber`, `Message`, `Subject`,
+`MessageStructure`, `MessageAttributes`, `MessageGroupId` and `MessageDeduplicationId` are the API's
+own fields, so a FIFO topic needs a `MessageGroupId` here just as it does from the SDK. A `Message`
+given as an object rather than a string is published as its JSON text, which is how a
+`.waitForTaskToken` task hands its token to the subscriber:
+
+```json
+{
+  "Type": "Task",
+  "Resource": "arn:aws:states:::sns:publish.waitForTaskToken",
+  "Parameters": {
+    "TopicArn": "arn:aws:sns:us-east-1:000000000000:myTopic",
+    "Message": {
+      "Input.$": "$.message",
+      "TaskToken.$": "$$.Task.Token"
+    }
+  },
+  "End": true
+}
+```
+
+A failure names the SDK exception class under the `SNS.` prefix, so a topic that does not exist
+fails the task with `SNS.NotFoundException` and a missing `Message` with
+`SNS.InvalidParameterException`. `arn:aws:states:::aws-sdk:sns:publish` is the same call under the
+`Sns.` prefix, as the AWS SDK integration table above shows.
 
 ## Publishing events
 
@@ -344,6 +527,10 @@ cause is the response serialized as a string, so a `Catch` can read which entry 
 ```json
 {"FailedEntryCount":1,"Entries":[{"EventId":"08cbdc46-…"},{"ErrorCode":"InvalidArgument","ErrorMessage":"EventBus not found: no-such-bus"}]}
 ```
+
+The optimized integration accepts `Detail` as a JSON object in JSONPath and JSONata workflows. It
+serializes that object once for the EventBridge request, preserving nested values and escaped text.
+The direct EventBridge API continues to accept its native string-valued `Detail` field.
 
 One deviation, and it belongs to EventBridge rather than to the integration: Floci rejects an entry
 addressed to an event bus that does not exist, while AWS accepts it and returns an `EventId`.
@@ -483,17 +670,19 @@ of every account are swept, each written back under its own account. Executions 
 reached a terminal status are left untouched, and so is the status and `stopDate` of one this sweep
 aborted on an earlier boot.
 
-Execution histories are held in memory, not in storage. The events recorded before the restart are
-gone, so the execution cannot be resumed, and `GetExecutionHistory` reports a single
-`ExecutionAborted` event, with an empty `executionAbortedEventDetails`, only for the boot that
-aborted it: after a further restart the execution is already terminal, no event is written, and the
-history is empty while `DescribeExecution` still reports the status and `stopDate`.
+Execution history is stored with the execution. While an execution is running, the current history
+is checkpointed every 100 events and when the execution reaches a terminal state. A graceful
+shutdown flushes the current execution state before the emulator stops. On restart, persisted
+history is retained, and a previously running execution is marked `ABORTED` with one
+`ExecutionAborted` event appended. After a further restart, the execution is already terminal, so
+no additional event is written.
 
 ## Configuration
 
 | Variable | Default | Description |
 |---|---|---|
 | `FLOCI_SERVICES_STEPFUNCTIONS_ENABLED` | `true` | Enable or disable the service |
+| `FLOCI_SERVICES_STEPFUNCTIONS_MAX_WAIT_SECONDS` | `30` | Ceiling in seconds on a `Wait` state pause and a `Retry` backoff |
 | `SFN_MOCK_CONFIG` | unset | Path to a Step Functions Local compatible mock configuration file (alias: `FLOCI_SERVICES_STEPFUNCTIONS_MOCK_CONFIG_FILE`) |
 
 ## Examples

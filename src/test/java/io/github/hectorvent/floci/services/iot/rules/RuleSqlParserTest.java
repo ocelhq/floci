@@ -143,16 +143,16 @@ class RuleSqlParserTest {
     @Test
     void reportsTheOffendingTokenAndPositionOfAnUnsupportedFunction() {
         RuleSqlParseException failure = assertThrows(RuleSqlParseException.class,
-                () -> RuleSqlParser.parse("SELECT clientid() FROM 'a/b'"));
+                () -> RuleSqlParser.parse("SELECT principal() FROM 'a/b'"));
 
-        assertEquals("clientid", failure.token());
+        assertEquals("principal", failure.token());
         assertEquals(7, failure.position());
-        assertTrue(failure.getMessage().contains("clientid"), failure.getMessage());
+        assertTrue(failure.getMessage().contains("principal"), failure.getMessage());
     }
 
     @ParameterizedTest
     @CsvSource(delimiter = '|', value = {
-            "SELECT * FROM 'a/b' WHERE state IN ('on')          | IN",
+            "SELECT * FROM 'a/b' WHERE state IN ('on')          | (",
             "SELECT * FROM 'a/b' WHERE state IS NULL            | IS",
             "SELECT CASE WHEN a THEN 1 END FROM 'a/b'           | WHEN",
             "SELECT * FROM 'a/b' WHERE encode(a, 'base64') = 'x'| encode",
@@ -201,11 +201,11 @@ class RuleSqlParserTest {
     }
 
     @Test
-    void rejectsANumberTooLargeToRepresent() {
+    void rejectsANumberWhoseExponentIsTooLargeToRepresent() {
         RuleSqlParseException failure = assertThrows(RuleSqlParseException.class,
-                () -> RuleSqlParser.parse("SELECT * FROM 'a/b' WHERE level = 99999999999999999999999"));
+                () -> RuleSqlParser.parse("SELECT * FROM 'a/b' WHERE level = 1e99999999999"));
 
-        assertEquals("99999999999999999999999", failure.token());
+        assertEquals("1e99999999999", failure.token());
     }
 
     @Test

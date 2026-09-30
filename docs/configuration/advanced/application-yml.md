@@ -38,8 +38,11 @@ The block below mirrors `src/main/resources/application.yml`, it's the effective
 floci:
   base-url: "http://localhost:4566"  # Used to build response URLs (SQS QueueUrl, SNS endpoints, etc.)
   # hostname: ""                     # When set, overrides the host in base-url for multi-container Docker
-  default-region: us-east-1
+  default-region: us-east-1           # Also selects the partition (cn-north-1 -> aws-cn)
   default-account-id: "000000000000"
+  partitions:
+    # id: aws                         # Pin the partition explicitly; derived from default-region when unset
+    allow-unknown-regions: false      # true serves a scope region no partition publishes or matches by pattern
 
   storage:
     mode: memory                      # memory | persistent | hybrid | wal
@@ -55,6 +58,8 @@ floci:
       # mount-user: "1001:1001"    # PosixUser: run mounting containers as uid[:gid]
       # mount-group-add: 2000      # supplementary gid added to mounting containers
     wal:
+      # Also the cadence at which journaled stores under persistent mode (CloudWatch Logs events,
+      # the S3 object index) fold their .wal file into the store's JSON file.
       compaction-interval-ms: 30000
     services:
       ssm:
@@ -66,7 +71,7 @@ floci:
       lambda:
         flush-interval-ms: 5000
       cloudwatchlogs:
-        flush-interval-ms: 5000
+        flush-interval-ms: 15000
       cloudwatchmetrics:
         flush-interval-ms: 5000
       secretsmanager:
@@ -104,6 +109,7 @@ floci:
     log-max-size: "10m"                      # Max size per container log file before rotation
     log-max-file: "3"                        # Number of rotated log files to retain
     docker-host: unix:///var/run/docker.sock # Docker daemon socket (shared by Lambda, RDS, ElastiCache)
+    max-connections: 1024                    # Docker client connection pool; each live Lambda container holds 2
     docker-config-path: ""                   # Path to dir containing Docker's config.json (e.g. /root/.docker)
     registry-credentials: []                 # Per-registry explicit credentials for private registries
 
@@ -115,7 +121,7 @@ floci:
     sqs:
       enabled: true
       default-visibility-timeout: 30         # Seconds
-      max-message-size: 1048576              # Bytes (1 MB)
+      max-message-size: 1048576              # Bytes (1 MiB, the AWS maximum)
       clear-fifo-deduplication-cache-on-purge: false  # When true, PurgeQueue clears SQS FIFO dedup and SNS FIFO topic dedup for topics subscribed to that queue
 
     s3:
@@ -124,6 +130,10 @@ floci:
 
     dynamodb:
       enabled: true
+      backend: native                         # native | local (forward calls to DynamoDB Local)
+      # local-endpoint: http://dynamodb-local:8000  # DynamoDB Local base URL, required when backend is local
+      local-connect-timeout-seconds: 2        # Seconds to wait for a connection to DynamoDB Local
+      local-request-timeout-seconds: 10       # Seconds to wait for DynamoDB Local to answer a forwarded request
 
     sns:
       enabled: true
@@ -131,6 +141,7 @@ floci:
     lambda:
       enabled: true
       ephemeral: false                        # true = remove container after each invocation
+      docker-flags: ""                        # Extra Docker create flags for Lambda containers
       ecr-base-uri: public.ecr.aws            # Registry for Lambda runtime images (legacy: floci.ecr-base-uri / FLOCI_ECR_BASE_URI)
       honour-architectures: false             # true = select the declared Lambda Docker architecture
       default-memory-mb: 128
@@ -186,6 +197,7 @@ floci:
       # default-postgres-image: "registry.example.com/postgres:16-alpine"
       # default-mysql-image: "registry.example.com/mysql:8.0"
       # default-mariadb-image: "registry.example.com/mariadb:11"
+      default-sql-server-image: "mcr.microsoft.com/mssql/server:2022-latest"
 
     rds-data:
       enabled: true
@@ -200,6 +212,7 @@ floci:
     cloudwatchlogs:
       enabled: true
       max-events-per-query: 10000
+      max-stored-events: 20000   # per account; oldest events are evicted once the store exceeds this
 
     cloudwatchmetrics:
       enabled: true
@@ -253,6 +266,11 @@ floci:
     ecs:
       enabled: true
       mock: false                             # true = tasks go to RUNNING without Docker (useful for CI)
+      docker-network: floci-net               # required for task-role credentials; must be user-defined
+      task-role-credentials:
+        enabled: false                        # vend real task IAM role credentials to task containers
+        ttl-seconds: 21600                    # six hours, matching AWS
+        port: 51679                           # Floci-side port; containers always use 169.254.170.2:80
 
     appsync:
       enabled: true
@@ -270,7 +288,7 @@ floci:
       enabled: true
       registry-image: "registry:2"
       registry-container-name: floci-ecr-registry
-      registry-base-port: 5100
+      registry-base-port: 5100              # private loopback backing port range
       registry-max-port: 5199
       data-path: ./data/ecr
       tls-enabled: false
@@ -307,6 +325,8 @@ All keys in this table are declared on `EmulatorConfig` and accept environment v
 | `FLOCI_SERVICES_ECS_DOCKER_NETWORK`                | *(unset)*        | Docker network for ECS task containers                        |
 | `FLOCI_SERVICES_ECS_DEFAULT_MEMORY_MB`             | `512`            | Default memory (MB) when task definition omits it             |
 | `FLOCI_SERVICES_ECS_DEFAULT_CPU_UNITS`             | `256`            | Default CPU units when task definition omits it               |
+| `FLOCI_SERVICES_ECS_HOST_VOLUME_ROOTS`             | *(unset)*        | Comma-separated allowlist of parent directories for host volume bind mounts; by default (unset, and `ALLOW_UNSAFE_HOST_VOLUMES=false`) every host volume `sourcePath` is rejected |
+| `FLOCI_SERVICES_ECS_ALLOW_UNSAFE_HOST_VOLUMES`     | `false`          | Allow any host path, bypassing the host-volume-roots allowlist (traversal, bare root, and the Docker socket or an ancestor directory of it are still always rejected) |
 | `FLOCI_SERVICES_IAM_ENFORCEMENT_ENABLED`           | `false`          | Enforce IAM identity-based policies on every request when `true` |
 | `FLOCI_SERVICES_OPENSEARCH_MOCK`                   | `false`          | Skip Docker; domains appear active immediately (useful for CI)   |
 | `FLOCI_SERVICES_OPENSEARCH_KEEP_RUNNING_ON_SHUTDOWN` | `false`        | Leave OpenSearch containers running after Floci stops            |

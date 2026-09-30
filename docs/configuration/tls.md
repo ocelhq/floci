@@ -50,18 +50,22 @@ Disabling verification (`--no-verify-ssl`, `verify=False`, `NODE_TLS_REJECT_UNAU
 | `FLOCI_TLS_KEY_PATH` | *(unset)* | Path to PEM private key file |
 | `FLOCI_TLS_SELF_SIGNED` | `true` | Auto-generate a server certificate signed by Floci's local CA when no cert/key paths provided |
 
+With TLS enabled, the proxy that accepts HTTP and HTTPS on Floci's ports listens on `QUARKUS_HTTP_HOST` (`127.0.0.1` by default). As without TLS, any address outside loopback also needs `FLOCI_SECURITY_ALLOW_UNSAFE_NETWORK_EXPOSURE=true`; see [Network Exposure](./environment-variables.md#network-exposure).
+
 ## Local CA and Server Certificate
 
 When `FLOCI_TLS_ENABLED=true` and no custom certificate is provided, Floci keeps a local root CA at `{persistent-path}/tls/floci-root-ca.crt` (key `floci-root-ca.key`, owner-only) and issues its server certificate `floci-server.crt` from it at startup. The server certificate:
 
 - Is persisted to `{persistent-path}/tls/` and reused across restarts
 - Includes `localhost`, `127.0.0.1`, `0.0.0.0`, `*.localhost`, `localhost.floci.io`,
-  `*.localhost.floci.io`, `*.execute-api.localhost.floci.io`, and
-  `*.execute-api.localhost.localstack.cloud` as Subject Alternative Names (SANs)
-- Automatically includes custom hostnames from `FLOCI_HOSTNAME` and `FLOCI_BASE_URL` in the SANs
+  `*.localhost.floci.io`, `*.execute-api.localhost.floci.io`,
+  `*.execute-api.localhost.localstack.cloud`, `*.cloudfront.localhost.floci.io`,
+  `*.cloudfront.localhost`, and `*.dkr.ecr.<region>.localhost.floci.io` for every advertised
+  AWS region as Subject Alternative Names (SANs)
+- Automatically includes custom hostnames from `FLOCI_HOSTNAME`, `FLOCI_BASE_URL` and `FLOCI_SERVICES_IOT_ENDPOINT_ADDRESS` in the SANs
 - Is regenerated when hostname configuration changes between restarts, or when it was not issued by the current CA
 
-The CA is created once and never rotates on its own. If its files are missing, corrupt or do not match each other, Floci generates a new CA, logs a warning, and reissues the server certificate; clients then need the new `ca.pem`.
+The CA key is created once and never rotates on its own. On the first start after upgrading from a version whose CA lacks X.509 key identifiers, Floci reissues the CA certificate with the same key and validity period, then reissues the server certificate. The CA certificate's fingerprint changes, so clients using a previously downloaded CA file must import the current `ca.pem` again. ACM and IoT certificates issued before the upgrade are not rewritten; reissue them if a strict client must verify them. If the CA files are missing, corrupt or do not match each other, Floci generates a new CA and key, logs a warning, and reissues the server certificate; clients then need the new `ca.pem`.
 
 ### Custom Hostname Support
 
@@ -125,7 +129,7 @@ No additional configuration is needed: Vert.x handles TLS at the transport layer
 
 ## MQTT over TLS (8883)
 
-When TLS is enabled, the IoT MQTT broker also listens on port 8883 with the same certificate as the HTTPS endpoint, hostnames learned at runtime included. Devices connect with `ssl://` trusting `ca.pem`; see [IoT Core](../services/iot.md#mqtt-over-tls).
+When TLS is enabled, the IoT MQTT broker also listens on port 8883 with the same certificate as the HTTPS endpoint, hostnames learned at runtime included. Devices connect with `ssl://` trusting `ca.pem`; see [IoT Core](../services/iot.md#mqtt-over-tls). Devices that take the hostname from `DescribeEndpoint` and add their own port need `FLOCI_SERVICES_IOT_ENDPOINT_ADDRESS`, see [Endpoint address](../services/iot.md#endpoint-address).
 
 ## SDK Configuration Examples
 

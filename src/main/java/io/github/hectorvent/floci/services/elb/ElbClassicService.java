@@ -3,10 +3,13 @@ package io.github.hectorvent.floci.services.elb;
 import com.fasterxml.jackson.core.type.TypeReference;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.AwsRegionFacts;
+import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.dns.EmbeddedDnsServer;
 import io.github.hectorvent.floci.core.storage.StorageBackedMap;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
+import io.github.hectorvent.floci.services.ec2.model.SecurityGroup;
 import io.github.hectorvent.floci.services.ec2.model.Subnet;
 import io.github.hectorvent.floci.services.elb.model.ClassicHealthCheck;
 import io.github.hectorvent.floci.services.elb.model.ClassicListener;
@@ -44,28 +47,35 @@ import java.util.stream.Collectors;
 @ApplicationScoped
 public class ElbClassicService {
 
-    /** The hosted zone ID AWS reports for Classic load balancers; fixed per region on AWS too. */
-    private static final String CANONICAL_HOSTED_ZONE_ID = "Z35SXDOTRQ7X7K";
-
     private static final SecureRandom RANDOM = new SecureRandom();
 
     private final Ec2Service ec2Service;
     private final ElbClassicHealthChecker healthChecker;
     private final StorageFactory storageFactory;
     private final EmulatorConfig config;
+    private final RegionResolver regionResolver;
 
     // region → load balancer name → record
     private Map<String, Map<String, ClassicLoadBalancer>> loadBalancers = new ConcurrentHashMap<>();
+
+    public ElbClassicService(Ec2Service ec2Service,
+                             ElbClassicHealthChecker healthChecker,
+                             StorageFactory storageFactory,
+                             EmulatorConfig config) {
+        this(ec2Service, healthChecker, storageFactory, config, null);
+    }
 
     @Inject
     public ElbClassicService(Ec2Service ec2Service,
                              ElbClassicHealthChecker healthChecker,
                              StorageFactory storageFactory,
-                             EmulatorConfig config) {
+                             EmulatorConfig config,
+                             RegionResolver regionResolver) {
         this.ec2Service = ec2Service;
         this.healthChecker = healthChecker;
         this.storageFactory = storageFactory;
         this.config = config;
+        this.regionResolver = regionResolver;
     }
 
     @PostConstruct
@@ -89,6 +99,18 @@ public class ElbClassicService {
      * nothing reachable from {@link #initializeStorage()} may touch an injected collaborator.
      */
     public void restorePersistedRuntime() {
+        // A balancer stored before the zone was looked up per region still carries the one fixed
+        // zone every balancer used to report; take the region's zone again and store it back.
+        for (String region : List.copyOf(loadBalancers.keySet())) {
+            Map<String, ClassicLoadBalancer> regionLbs = loadBalancers.get(region);
+            if (regionLbs == null) {
+                continue;
+            }
+            for (ClassicLoadBalancer lb : regionLbs.values()) {
+                lb.setCanonicalHostedZoneNameId(AwsRegionFacts.classicElbHostedZoneId(region).orElse(null));
+            }
+            loadBalancers.put(region, regionLbs);
+        }
         for (Map<String, ClassicLoadBalancer> regionLbs : loadBalancers.values()) {
             for (ClassicLoadBalancer lb : regionLbs.values()) {
                 healthChecker.startMonitoring(lb);
@@ -131,13 +153,17 @@ public class ElbClassicService {
         ClassicLoadBalancer lb = new ClassicLoadBalancer();
         lb.setLoadBalancerName(name);
         lb.setRegion(region);
+        if (regionResolver != null && regionResolver.getAccountId() != null) {
+            lb.setAccountId(regionResolver.getAccountId());
+        }
         lb.setDnsName(dnsName);
         lb.setCanonicalHostedZoneName(dnsName);
-        lb.setCanonicalHostedZoneNameId(CANONICAL_HOSTED_ZONE_ID);
+        lb.setCanonicalHostedZoneNameId(AwsRegionFacts.classicElbHostedZoneId(region).orElse(null));
         lb.setScheme(scheme != null && !scheme.isBlank() ? scheme : "internet-facing");
         lb.setCreatedTime(Instant.now());
         lb.setListeners(new ArrayList<>(listeners));
         lb.setSecurityGroups(securityGroups != null ? new ArrayList<>(securityGroups) : new ArrayList<>());
+        populateSourceSecurityGroup(region, lb);
         lb.setHealthCheck(ClassicHealthCheck.defaults());
         if (tags != null && !tags.isEmpty()) {
             lb.setTags(new LinkedHashMap<>(tags));
@@ -176,6 +202,28 @@ public class ElbClassicService {
             result.add(lb);
         }
         return result;
+    }
+
+    private void populateSourceSecurityGroup(String region, ClassicLoadBalancer lb) {
+        if (lb.getSecurityGroups() == null || lb.getSecurityGroups().isEmpty()) {
+            lb.setSourceSecurityGroupOwnerAlias(null);
+            lb.setSourceSecurityGroupName(null);
+            return;
+        }
+
+        String sourceGroupId = lb.getSecurityGroups().getFirst();
+        List<SecurityGroup> matches = ec2Service.describeSecurityGroups(
+                region, List.of(sourceGroupId), List.of(), Map.of());
+        if (matches.isEmpty()) {
+            lb.setSourceSecurityGroupOwnerAlias(null);
+            lb.setSourceSecurityGroupName(null);
+            return;
+        }
+
+        SecurityGroup sourceGroup = matches.getFirst();
+        lb.setSourceSecurityGroupOwnerAlias(
+                regionResolver != null ? regionResolver.getAccountId() : sourceGroup.getOwnerId());
+        lb.setSourceSecurityGroupName(sourceGroup.getGroupName());
     }
 
     /** Deletes a load balancer. Deleting one that does not exist succeeds, as it does on AWS. */
@@ -325,6 +373,7 @@ public class ElbClassicService {
     public List<String> applySecurityGroups(String region, String name, List<String> securityGroups) {
         ClassicLoadBalancer lb = requireLoadBalancer(region, name);
         lb.setSecurityGroups(new ArrayList<>(securityGroups));
+        populateSourceSecurityGroup(region, lb);
         persist(region);
         return List.copyOf(lb.getSecurityGroups());
     }

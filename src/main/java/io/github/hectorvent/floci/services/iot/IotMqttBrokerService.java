@@ -1,7 +1,9 @@
 package io.github.hectorvent.floci.services.iot;
 
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.Resettable;
 import io.github.hectorvent.floci.services.iot.model.IotRetainedMessage;
+import io.netty.handler.codec.mqtt.MqttConnectReturnCode;
 import io.netty.handler.codec.mqtt.MqttQoS;
 import io.quarkus.runtime.ShutdownEvent;
 import io.quarkus.runtime.StartupEvent;
@@ -10,6 +12,7 @@ import io.quarkus.tls.TlsConfiguration;
 import io.quarkus.tls.TlsConfigurationRegistry;
 import io.quarkus.tls.runtime.config.TlsConfig;
 import io.vertx.core.Vertx;
+import io.vertx.core.WorkerExecutor;
 import io.vertx.core.buffer.Buffer;
 import io.vertx.core.http.ClientAuth;
 import io.vertx.core.net.KeyCertOptions;
@@ -18,18 +21,25 @@ import io.vertx.core.net.TrustOptions;
 import io.vertx.mqtt.MqttEndpoint;
 import io.vertx.mqtt.MqttServer;
 import io.vertx.mqtt.MqttServerOptions;
+import io.vertx.mqtt.MqttTopicSubscription;
 import io.vertx.mqtt.messages.MqttPublishMessage;
 import io.vertx.mqtt.messages.MqttSubscribeMessage;
 import io.vertx.mqtt.messages.MqttUnsubscribeMessage;
+import jakarta.annotation.Priority;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.enterprise.event.Observes;
 import jakarta.enterprise.inject.Instance;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
+import javax.net.ssl.ExtendedSSLSession;
+import javax.net.ssl.SNIHostName;
 import javax.net.ssl.SSLEngine;
+import javax.net.ssl.SSLPeerUnverifiedException;
+import javax.net.ssl.SSLSession;
 import javax.net.ssl.X509ExtendedTrustManager;
 import java.net.Socket;
+import java.security.cert.Certificate;
 import java.security.cert.CertificateException;
 import java.security.cert.X509Certificate;
 import java.util.ArrayList;
@@ -40,17 +50,22 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.regex.Pattern;
 
 @ApplicationScoped
-public class IotMqttBrokerService {
+public class IotMqttBrokerService implements Resettable {
 
     private static final Logger LOG = Logger.getLogger(IotMqttBrokerService.class);
 
     /**
-     * The TLS listener asks for a client certificate and accepts whichever one is presented: AWS
-     * IoT trusts a device certificate because it is registered, not because of its issuer, and
-     * that lookup belongs to the broker, not to the handshake. Until it exists, 8883 admits every
-     * client exactly as 1883 does.
+     * The TLS listener asks for a client certificate and lets the handshake complete with whichever
+     * one is presented: AWS IoT trusts a device certificate because it is registered, not because
+     * of its issuer, and that lookup happens on the CONNECT in {@link #handleEndpoint}, where a
+     * certificate that is missing, unregistered, inactive or not allowed to connect is answered
+     * with CONNACK not authorized.
      */
     static final X509ExtendedTrustManager ACCEPT_ANY_CLIENT_CERTIFICATE = new X509ExtendedTrustManager() {
         @Override
@@ -86,12 +101,35 @@ public class IotMqttBrokerService {
         }
     };
 
+    /** AWS IoT Core's MQTT payload quota; a larger PUBLISH disconnects the client unacknowledged. */
+    private static final int MAX_PAYLOAD_SIZE = 128 * 1024;
+
+    /** AWS IoT Core's MQTT packet quota, counted as Netty's decoder counts: variable header plus payload. */
+    private static final int MAX_PACKET_SIZE = 146 * 1024;
+
+    private static final Pattern IPV4_LITERAL = Pattern.compile("\\d{1,3}(\\.\\d{1,3}){3}");
+
+    static final int MAX_PENDING_RULE_EVALUATIONS = 1_000;
+
+    private static final long RULES_RESETTING = 1;
+    private static final long RULES_STOPPED = 2;
+    private static final long RULE_STATE_STEP = 4;
+
     private final EmulatorConfig config;
     private final Vertx vertx;
     private final Instance<IotService> iotService;
     private final TlsConfigurationRegistry tlsRegistry;
+    final WorkerExecutor ruleWorker;
     private final Map<String, ClientSession> sessionsByClient = new ConcurrentHashMap<>();
     private final Map<String, Map<String, Subscription>> subscriptionsByClient = new ConcurrentHashMap<>();
+    private final AtomicInteger pendingRuleEvaluations = new AtomicInteger();
+    private final AtomicBoolean ruleEvaluationsThrottled = new AtomicBoolean();
+    /**
+     * Rule admission in one value: the {@link #RULES_RESETTING} and {@link #RULES_STOPPED} bits suspend rules, and
+     * every change also adds {@link #RULE_STATE_STEP}, so an evaluation runs its rules only while the state is still
+     * the one it was admitted under.
+     */
+    private final AtomicLong ruleState = new AtomicLong();
     private MqttServer server;
     private MqttServer tlsServer;
     private ReloadingKeyManager keyManager;
@@ -103,6 +141,7 @@ public class IotMqttBrokerService {
         this.vertx = vertx;
         this.iotService = iotService;
         this.tlsRegistry = tlsRegistry;
+        this.ruleWorker = vertx.createSharedWorkerExecutor("floci-iot-mqtt-rules", 1);
     }
 
     void onStart(@Observes StartupEvent ignored) {
@@ -117,8 +156,43 @@ public class IotMqttBrokerService {
         startIfEnabled();
     }
 
+    // Rules stop before EmulatorLifecycle's default-priority storage flush and shutdown. The blocking server close
+    // stays at default priority, so this ordering does not move it ahead of the flush.
+    void onShutdownStarted(@Observes @Priority(1000) ShutdownEvent ignored) {
+        suspendRules(RULES_STOPPED);
+    }
+
     void onStop(@Observes ShutdownEvent ignored) {
         stop();
+    }
+
+    /**
+     * Emulator reset: rules still waiting are skipped, and publishes received until
+     * {@link #afterReset()} run none, so none writes into the cleared state; one already running
+     * finishes.
+     */
+    @Override
+    public void beforeReset() {
+        suspendRules(RULES_RESETTING);
+    }
+
+    /**
+     * Rules run again for publishes received from now on, unless the broker is stopped. The state
+     * moves on only if {@link #beforeReset()} suspended rules, so an evaluation queued before or
+     * during the reset still skips its rules, and one waiting when a lone afterReset() runs does
+     * not.
+     */
+    @Override
+    public void afterReset() {
+        resumeRules(RULES_RESETTING);
+    }
+
+    /**
+     * The broker keeps nothing in Floci storage; a reset only suspends rules, in
+     * {@link #beforeReset()}.
+     */
+    @Override
+    public void clear() {
     }
 
     synchronized void startIfEnabled() {
@@ -129,22 +203,31 @@ public class IotMqttBrokerService {
             return;
         }
 
-        MqttServer mqttServer = listen(new MqttServerOptions()
-                .setHost(config.services().iot().mqtt().host())
-                .setPort(config.services().iot().mqtt().port()), "IoT MQTT broker");
+        // Rules resume before either listener accepts a connection, so a shutdown starting during the listen
+        // keeps them off, and a failed start suspends them again.
+        resumeRules(RULES_STOPPED);
+        MqttServer mqttServer = null;
         try {
+            mqttServer = listen(new MqttServerOptions()
+                    .setHost(config.services().iot().mqtt().host())
+                    .setPort(config.services().iot().mqtt().port())
+                    .setMaxMessageSize(MAX_PACKET_SIZE), "IoT MQTT broker", false);
             startTlsListener();
         } catch (RuntimeException e) {
-            mqttServer.close().toCompletionStage().toCompletableFuture().join();
+            suspendRules(RULES_STOPPED);
+            if (mqttServer != null) {
+                mqttServer.close().toCompletionStage().toCompletableFuture().join();
+            }
             throw e;
         }
         server = mqttServer;
     }
 
     /**
-     * The MQTT over TLS listener, AWS IoT's 8883, sharing every handler with the plaintext one.
-     * Its key material is the TLS registry's default configuration, the same certificate the HTTPS
-     * endpoint presents. Not opened when the port is 0 or TLS is off.
+     * The MQTT over TLS listener, AWS IoT's 8883, sharing every handler with the plaintext one but
+     * admitting only registered devices whose policies allow the connect. Its key material is the
+     * TLS registry's default configuration, the same certificate the HTTPS endpoint presents. Not
+     * opened when the port is 0 or TLS is off.
      */
     private void startTlsListener() {
         int tlsPort = config.services().iot().mqtt().tlsPort();
@@ -165,16 +248,17 @@ public class IotMqttBrokerService {
         tlsServer = listen(new MqttServerOptions()
                 .setHost(config.services().iot().mqtt().host())
                 .setPort(tlsPort)
+                .setMaxMessageSize(MAX_PACKET_SIZE)
                 .setSsl(true)
                 .setKeyCertOptions(KeyCertOptions.wrap(manager))
                 .setTrustOptions(TrustOptions.wrap(ACCEPT_ANY_CLIENT_CERTIFICATE))
-                .setClientAuth(ClientAuth.REQUEST), "IoT MQTT TLS broker");
+                .setClientAuth(ClientAuth.REQUEST), "IoT MQTT TLS broker", true);
         keyManager = manager;
     }
 
-    private MqttServer listen(MqttServerOptions options, String name) {
+    private MqttServer listen(MqttServerOptions options, String name, boolean verifyDevice) {
         MqttServer mqttServer = MqttServer.create(vertx, options);
-        mqttServer.endpointHandler(this::handleEndpoint);
+        mqttServer.endpointHandler(endpoint -> handleEndpoint(endpoint, verifyDevice));
         mqttServer.exceptionHandler(error -> LOG.warnv("{0} error: {1}", name, error.getMessage()));
         try {
             mqttServer.listen().toCompletionStage().toCompletableFuture().join();
@@ -206,6 +290,7 @@ public class IotMqttBrokerService {
     }
 
     synchronized void stop() {
+        suspendRules(RULES_STOPPED);
         MqttServer mqttServer = server;
         MqttServer mqttTlsServer = tlsServer;
         if (mqttServer == null && mqttTlsServer == null) {
@@ -214,7 +299,13 @@ public class IotMqttBrokerService {
         server = null;
         tlsServer = null;
         keyManager = null;
-        sessionsByClient.values().forEach(session -> session.endpoint().close());
+        sessionsByClient.values().forEach(session -> {
+            try {
+                session.endpoint().close();
+            } catch (IllegalStateException e) {
+                LOG.debugv("IoT MQTT client {0} was already closed during broker shutdown", session.clientId());
+            }
+        });
         sessionsByClient.clear();
         subscriptionsByClient.clear();
         if (mqttServer != null) {
@@ -226,15 +317,20 @@ public class IotMqttBrokerService {
         LOG.info("IoT MQTT broker stopped");
     }
 
+    private void suspendRules(long reason) {
+        ruleState.updateAndGet(state -> (state | reason) + RULE_STATE_STEP);
+    }
+
+    private void resumeRules(long reason) {
+        ruleState.updateAndGet(state -> (state & reason) == 0 ? state : (state & ~reason) + RULE_STATE_STEP);
+    }
+
     public synchronized boolean isRunning() {
         return server != null;
     }
 
     void publish(String topic, byte[] payload) {
-        if (server == null) {
-            return;
-        }
-        fanOut(topic, payload == null ? new byte[0] : payload, false);
+        fanOut(topic, payload, false);
     }
 
     boolean disconnectClient(String clientId, boolean cleanSession) {
@@ -266,13 +362,32 @@ public class IotMqttBrokerService {
                 .toList();
     }
 
-    private void handleEndpoint(MqttEndpoint endpoint) {
+    /**
+     * On the TLS listener the CONNECT is admitted only for a presented certificate that IoT Core
+     * has registered and whose attached policies allow {@code iot:Connect} for the client id;
+     * anything else is answered with CONNACK not authorized (return code 5, reason code 0x87 on
+     * MQTT 5) and never becomes a session, so a client already holding that client id keeps its
+     * connection. The plaintext listener, which the WebSocket bridge also lands on, stays open to
+     * every client.
+     */
+    void handleEndpoint(MqttEndpoint endpoint, boolean verifyDevice) {
         String clientId = endpoint.clientIdentifier();
         SocketAddress remoteAddress = endpoint.remoteAddress();
+        String sourceIp = remoteAddress == null ? null : remoteAddress.host();
+        String principal = null;
+        if (verifyDevice) {
+            principal = admittedDevice(endpoint, clientId, sourceIp);
+            if (principal == null) {
+                endpoint.reject(endpoint.protocolVersion() == 5
+                        ? MqttConnectReturnCode.CONNECTION_REFUSED_NOT_AUTHORIZED_5
+                        : MqttConnectReturnCode.CONNECTION_REFUSED_NOT_AUTHORIZED);
+                return;
+            }
+        }
         ClientSession session = new ClientSession(
                 clientId,
                 endpoint,
-                remoteAddress == null ? null : remoteAddress.host(),
+                sourceIp,
                 remoteAddress == null ? -1 : remoteAddress.port(),
                 endpoint.isCleanSession());
 
@@ -291,6 +406,75 @@ public class IotMqttBrokerService {
         }
 
         endpoint.accept();
+        if (principal != null) {
+            LOG.debugv("IoT MQTT TLS client {0} admitted as {1}", clientId, principal);
+        }
+    }
+
+    /**
+     * The certificate ARN of the device behind the connection when it may connect, otherwise null.
+     * A failure while deciding refuses the client rather than leaving the CONNECT unanswered. A
+     * refusal is the client's own doing and reaches it as the CONNACK, so it is logged at debug
+     * only: the CONNECT is reachable by anyone.
+     */
+    private String admittedDevice(MqttEndpoint endpoint, String clientId, String sourceIp) {
+        try {
+            Optional<IotService.RegisteredDevice> device = presentedDevice(endpoint);
+            if (device.isEmpty()) {
+                LOG.debugv("IoT MQTT TLS client {0} refused: no registered certificate presented", clientId);
+                return null;
+            }
+            String certificateArn = device.get().certificate().getCertificateArn();
+            if (!iotService.get().isConnectAllowed(device.get(), clientId, sourceIp, requestedServerName(endpoint))) {
+                LOG.debugv("IoT MQTT TLS client {0} refused: iot:Connect is not allowed for {1}", clientId, certificateArn);
+                return null;
+            }
+            return certificateArn;
+        } catch (RuntimeException e) {
+            LOG.warnv(e, "IoT MQTT TLS client {0} refused: device verification failed: {1}", clientId, e.getMessage());
+            return null;
+        }
+    }
+
+    /** The registered certificate behind the peer's leaf, if the client presented one at all. */
+    private Optional<IotService.RegisteredDevice> presentedDevice(MqttEndpoint endpoint) {
+        SSLSession session = endpoint.isSsl() ? endpoint.sslSession() : null;
+        if (session == null) {
+            return Optional.empty();
+        }
+        Certificate[] chain;
+        try {
+            chain = session.getPeerCertificates();
+        } catch (SSLPeerUnverifiedException e) {
+            LOG.debugv("IoT MQTT TLS client {0} presented no certificate", endpoint.clientIdentifier());
+            return Optional.empty();
+        }
+        if (chain.length == 0 || !(chain[0] instanceof X509Certificate leaf)) {
+            return Optional.empty();
+        }
+        return iotService.get().findRegisteredCertificate(leaf);
+    }
+
+    /**
+     * The server name the client sent in the handshake, which AWS IoT exposes as
+     * {@code iot:DomainName}. An address literal is not a domain name: some clients send the
+     * host they dialled as SNI even when it is an IP.
+     */
+    private static String requestedServerName(MqttEndpoint endpoint) {
+        if (!(endpoint.sslSession() instanceof ExtendedSSLSession session)) {
+            return null;
+        }
+        return session.getRequestedServerNames().stream()
+                .filter(SNIHostName.class::isInstance)
+                .map(name -> ((SNIHostName) name).getAsciiName())
+                .filter(name -> !isAddressLiteral(name))
+                .findFirst()
+                .orElse(null);
+    }
+
+    /** An IPv4 dotted quad, or anything carrying a colon, which only an IPv6 literal does. */
+    static boolean isAddressLiteral(String name) {
+        return name.indexOf(':') >= 0 || IPV4_LITERAL.matcher(name).matches();
     }
 
     private void handleSubscribe(ClientSession session, MqttSubscribeMessage message) {
@@ -299,7 +483,7 @@ public class IotMqttBrokerService {
         List<MqttQoS> grantedQos = new ArrayList<>();
         List<Subscription> accepted = new ArrayList<>();
 
-        for (io.vertx.mqtt.MqttTopicSubscription requested : message.topicSubscriptions()) {
+        for (MqttTopicSubscription requested : message.topicSubscriptions()) {
             String topicFilter = requested.topicName();
             MqttQoS qos = requested.qualityOfService();
             if (!isValidTopicFilter(topicFilter) || qos == MqttQoS.EXACTLY_ONCE) {
@@ -332,6 +516,12 @@ public class IotMqttBrokerService {
     }
 
     private void handlePublish(ClientSession session, MqttPublishMessage message) {
+        if (message.payload().length() > MAX_PAYLOAD_SIZE) {
+            LOG.debugv("IoT MQTT client {0} disconnected: {1} byte payload on {2} exceeds the AWS limit",
+                    session.clientId(), Integer.toString(message.payload().length()), message.topicName());
+            session.endpoint().close();
+            return;
+        }
         byte[] payload = message.payload().getBytes();
         if (message.qosLevel() == MqttQoS.EXACTLY_ONCE) {
             session.endpoint().close();
@@ -347,8 +537,47 @@ public class IotMqttBrokerService {
             return;
         }
 
-        iotService.get().publish(topic, payload, message.isRetain(), message.qosLevel().value(), null);
+        iotService.get().publish(topic, payload, message.isRetain(), message.qosLevel().value(), null,
+                session.clientId(), rules -> evaluateRulesOnWorker(topic, rules));
         fanOut(topic, payload, false);
+    }
+
+    /**
+     * Runs a publish's topic rules on the broker's own single-thread worker, one publish at a time
+     * in the order they were submitted, so a rule action that blocks holds neither an event loop
+     * nor another service's blocking tasks, though it delays the rules of later publishes. At most
+     * {@link #MAX_PENDING_RULE_EVALUATIONS} evaluations are pending, running or waiting; beyond
+     * that a publish's rules are skipped. A reset or a stop skips the rules of publishes still
+     * waiting, and a publish received during the reset or while the broker is stopped never runs
+     * its rules.
+     */
+    void evaluateRulesOnWorker(String topic, Runnable rules) {
+        long admitted = ruleState.get();
+        if ((admitted & (RULES_RESETTING | RULES_STOPPED)) != 0) {
+            return;
+        }
+        // ponytail: beyond the bound a publish's rules are skipped rather than applying backpressure, since QoS 0 has no PUBACK to withhold.
+        if (pendingRuleEvaluations.incrementAndGet() > MAX_PENDING_RULE_EVALUATIONS) {
+            pendingRuleEvaluations.decrementAndGet();
+            if (ruleEvaluationsThrottled.compareAndSet(false, true)) {
+                LOG.warnv("IoT rule evaluation for topic {0} is skipped because {1} evaluations are already pending; later skips are not logged until the backlog drains",
+                        topic, Integer.toString(MAX_PENDING_RULE_EVALUATIONS));
+            }
+            return;
+        }
+        ruleWorker.executeBlocking(() -> {
+            if (ruleState.get() == admitted) {
+                rules.run();
+            }
+            return null;
+        }, false).onComplete(result -> {
+            if (pendingRuleEvaluations.decrementAndGet() == 0) {
+                ruleEvaluationsThrottled.set(false);
+            }
+            if (result.failed()) {
+                LOG.warnv(result.cause(), "IoT rule evaluation for topic {0} failed", topic);
+            }
+        });
     }
 
     private void fanOut(String topic, byte[] payload, boolean retained) {
@@ -357,7 +586,11 @@ public class IotMqttBrokerService {
             if (!session.endpoint().isConnected() || !hasMatchingSubscription(session.clientId(), topic)) {
                 continue;
             }
-            session.endpoint().publish(topic, Buffer.buffer(safePayload), MqttQoS.AT_MOST_ONCE, false, retained);
+            try {
+                session.endpoint().publish(topic, Buffer.buffer(safePayload), MqttQoS.AT_MOST_ONCE, false, retained);
+            } catch (IllegalStateException e) {
+                LOG.debugv("IoT MQTT client {0} closed before the publish on {1} reached it", session.clientId(), topic);
+            }
         }
     }
 

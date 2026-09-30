@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.iam;
 
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
+import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.AwsNamespaces;
 import io.github.hectorvent.floci.core.common.AwsQueryController;
 import io.github.hectorvent.floci.core.common.AwsQueryResponse;
@@ -20,6 +21,7 @@ import jakarta.ws.rs.core.MultivaluedMap;
 import jakarta.ws.rs.core.Response;
 import org.jboss.logging.Logger;
 
+import java.security.SecureRandom;
 import java.security.interfaces.RSAPublicKey;
 import java.time.Instant;
 import java.time.format.DateTimeFormatter;
@@ -38,7 +40,7 @@ public class StsQueryHandler {
 
     private static final Logger LOG = Logger.getLogger(StsQueryHandler.class);
     private static final String CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-    private static final String STS_AUDIENCE = "sts.amazonaws.com";
+    private static final String STS_AUDIENCE = "sts.amazonaws.com"; // partition-literal: web-identity audience; no source outside the commercial partition (P9)
 
     private final IamService iamService;
     private final AccountResolver accountResolver;
@@ -48,6 +50,11 @@ public class StsQueryHandler {
     private final WebIdentityTrustPolicyEvaluator webIdentityTrustEvaluator;
     private final WebIdentityTokenVerifier tokenVerifier;
     private final OidcIssuerKeyLookup oidcIssuerKeys;
+    private final SAMLProviderService samlProviderService;
+    private final SAMLTrustPolicyEvaluator samlTrustEvaluator;
+
+    /** CSPRNG for session secret keys and session tokens; ordinary IDs keep using {@link ThreadLocalRandom}. */
+    private final SecureRandom secureRandom = new SecureRandom();
 
     @Context
     HttpHeaders headers;
@@ -57,7 +64,9 @@ public class StsQueryHandler {
                            EmulatorConfig config, AssumeRolePolicyEvaluator trustPolicyEvaluator,
                            WebIdentityTrustPolicyEvaluator webIdentityTrustEvaluator,
                            WebIdentityTokenVerifier tokenVerifier,
-                           OidcIssuerKeyLookup oidcIssuerKeys) {
+                           OidcIssuerKeyLookup oidcIssuerKeys,
+                           SAMLProviderService samlProviderService,
+                           SAMLTrustPolicyEvaluator samlTrustEvaluator) {
         this.iamService = iamService;
         this.accountResolver = accountResolver;
         this.regionResolver = regionResolver;
@@ -66,6 +75,8 @@ public class StsQueryHandler {
         this.webIdentityTrustEvaluator = webIdentityTrustEvaluator;
         this.tokenVerifier = tokenVerifier;
         this.oidcIssuerKeys = oidcIssuerKeys;
+        this.samlProviderService = samlProviderService;
+        this.samlTrustEvaluator = samlTrustEvaluator;
     }
 
     public Response handle(String action, MultivaluedMap<String, String> params) {
@@ -88,6 +99,10 @@ public class StsQueryHandler {
         Response validation = validateRequired(params, "RoleArn", "RoleSessionName");
         if (validation != null) {
             return validation;
+        }
+        Response durationValidation = validateDurationSeconds(params, 900, 43200);
+        if (durationValidation != null) {
+            return durationValidation;
         }
         String roleArn = getParam(params, "RoleArn");
         String sessionName = getParam(params, "RoleSessionName");
@@ -117,7 +132,8 @@ public class StsQueryHandler {
         // these temporary credentials to the assumed role's account.
         String sessionPolicy = getParam(params, "Policy");
         iamService.registerSession(
-                accessKeyId, secretKey, sessionToken, roleArn, expiration, sessionPolicy, callerAccountId);
+                accessKeyId, secretKey, sessionToken, roleArn, expiration, sessionPolicy, callerAccountId,
+                sessionName, assumedRoleId);
 
         String result = new XmlBuilder()
                 .raw(credentialsXml(accessKeyId, secretKey, sessionToken, expiration))
@@ -162,8 +178,9 @@ public class StsQueryHandler {
         String accessKeyId = authorization == null ? null : accountResolver.extractAccessKeyId(authorization);
         String arn = iamService.resolveCallerArn(accessKeyId)
                 .orElse(AwsArnUtils.Arn.of("iam", "", accountId, "root").toString());
+        String userId = iamService.resolveCallerUserId(accessKeyId).orElse(accountId);
         String result = new XmlBuilder()
-                .elem("UserId", accountId)
+                .elem("UserId", userId)
                 .elem("Account", accountId)
                 .elem("Arn", arn)
                 .build();
@@ -171,6 +188,10 @@ public class StsQueryHandler {
     }
 
     private Response handleGetSessionToken(MultivaluedMap<String, String> params) {
+        Response durationValidation = validateDurationSeconds(params, 900, 129600);
+        if (durationValidation != null) {
+            return durationValidation;
+        }
         int durationSeconds = getIntParam(params, "DurationSeconds", 43200);
         String accessKeyId = "ASIA" + randomId(16);
         String secretKey = randomSecret(40);
@@ -189,6 +210,10 @@ public class StsQueryHandler {
         if (validation != null) {
             return validation;
         }
+        Response durationValidation = validateDurationSeconds(params, 900, 43200);
+        if (durationValidation != null) {
+            return durationValidation;
+        }
         String roleArn = getParam(params, "RoleArn");
         String sessionName = getParam(params, "RoleSessionName");
         String providerId = getParam(params, "ProviderId");
@@ -199,9 +224,6 @@ public class StsQueryHandler {
         String callerAccountId = regionResolver.getAccountId();
         String accountId = AwsArnUtils.accountOrDefault(roleArn, callerAccountId);
 
-        // Only tokens naming an issuer Floci itself hosts (an EKS cluster's IRSA OIDC provider) are
-        // verifiable, so only those are enforced. An opaque or third-party token keeps the historical
-        // permissive behaviour rather than failing a workflow Floci cannot adjudicate.
         WebIdentityOutcome outcome = verifyWebIdentityToken(webIdentityToken, roleName, accountId, roleArn);
         if (outcome.denial() != null) {
             return outcome.denial();
@@ -218,12 +240,13 @@ public class StsQueryHandler {
 
         String provider = verified != null ? verified.issuer()
                 : (providerId != null && !providerId.isBlank() ? providerId : "accounts.google.com");
-        String audience = verified != null ? verified.audience() : "sts.amazonaws.com";
+        String audience = verified != null ? verified.audience() : STS_AUDIENCE;
         String subject = verified != null ? verified.subject() : "web-identity-subject";
 
         String sessionPolicy = getParam(params, "Policy");
         iamService.registerSession(
-                accessKeyId, secretKey, sessionToken, roleArn, expiration, sessionPolicy, callerAccountId);
+                accessKeyId, secretKey, sessionToken, roleArn, expiration, sessionPolicy, callerAccountId,
+                sessionName, assumedRoleId);
 
         String result = new XmlBuilder()
                 .raw(credentialsXml(accessKeyId, secretKey, sessionToken, expiration))
@@ -242,16 +265,11 @@ public class StsQueryHandler {
     /** The claims of a token Floci issued and verified, used to fill the response accurately. */
     private record VerifiedWebIdentity(String issuer, String subject, String audience) {}
 
-    /**
-     * The result of inspecting a web identity token: at most one field is non-null. Both null means
-     * the issuer is unknown to Floci, so the token is treated as opaque and accepted.
-     */
     private record WebIdentityOutcome(VerifiedWebIdentity verified, Response denial) {
 
         static WebIdentityOutcome unverifiable() {
             return new WebIdentityOutcome(null, null);
         }
-
         static WebIdentityOutcome allow(VerifiedWebIdentity verified) {
             return new WebIdentityOutcome(verified, null);
         }
@@ -261,25 +279,33 @@ public class StsQueryHandler {
         }
     }
 
-    /**
-     * Inspects {@code token} and decides whether it may assume {@code roleArn}. Returns an outcome
-     * carrying the verified claims, a denial response, or neither when the token's issuer is not one
-     * Floci hosts (preserving the historical permissive behaviour for third-party providers).
-     */
+    /** Inspects {@code token} and decides whether it may assume {@code roleArn}. */
     private WebIdentityOutcome verifyWebIdentityToken(String token, String roleName, String roleAccountId,
                                                       String roleArn) {
         Optional<String> issuer = tokenVerifier.peekIssuer(token);
         if (issuer.isEmpty()) {
-            return WebIdentityOutcome.unverifiable();
+            return config.services().iam().enforcementEnabled()
+                    ? WebIdentityOutcome.deny(AwsQueryResponse.error("InvalidIdentityToken",
+                    "The web identity token does not identify a trusted issuer.", AwsNamespaces.STS, 400))
+                    : WebIdentityOutcome.unverifiable();
         }
         Optional<RSAPublicKey> key = oidcIssuerKeys.findVerificationKey(issuer.get());
         if (key.isEmpty()) {
-            return WebIdentityOutcome.unverifiable();
+            return config.services().iam().enforcementEnabled()
+                    ? WebIdentityOutcome.deny(AwsQueryResponse.error("InvalidIdentityToken",
+                    "The web identity token issuer is not trusted.", AwsNamespaces.STS, 400))
+                    : WebIdentityOutcome.unverifiable();
         }
 
         WebIdentityToken claims;
         try {
             claims = tokenVerifier.verify(token, key.get(), issuer.get(), STS_AUDIENCE);
+        } catch (WebIdentityTokenVerifier.ExpiredTokenException e) {
+            LOG.debugv("Rejecting web identity token for role {0}: {1}", roleArn, e.getMessage());
+            return WebIdentityOutcome.deny(AwsQueryResponse.error("ExpiredTokenException",
+                    "The web identity token that was passed is expired or is not valid. Get a new "
+                            + "identity token from the identity provider and then retry the request.",
+                    AwsNamespaces.STS, 400));
         } catch (WebIdentityTokenVerifier.InvalidTokenException e) {
             LOG.debugv("Rejecting web identity token for role {0}: {1}", roleArn, e.getMessage());
             return WebIdentityOutcome.deny(AwsQueryResponse.error("InvalidIdentityToken",
@@ -330,36 +356,65 @@ public class StsQueryHandler {
         if (validation != null) {
             return validation;
         }
+        Response durationValidation = validateDurationSeconds(params, 900, 43200);
+        if (durationValidation != null) {
+            return durationValidation;
+        }
         String roleArn = getParam(params, "RoleArn");
-        String sessionName = "saml-session";
+        String principalArn = getParam(params, "PrincipalArn");
         int durationSeconds = getIntParam(params, "DurationSeconds", 3600);
 
+        var provider = samlProviderService.find(principalArn).orElseThrow(() ->
+                new AwsException("InvalidIdentityToken", "The SAML provider is not trusted.", 400));
+        SAMLAssertionVerifier.Verified verified;
+        try {
+            verified = SAMLAssertionVerifier.verify(getParam(params, "SAMLAssertion"), provider, Instant.now());
+        } catch (SAMLAssertionVerifier.InvalidAssertionException e) {
+            throw new AwsException("InvalidIdentityToken", e.awsMessage(), 400);
+        }
+        boolean rolePair = verified.roles().stream().anyMatch(pair ->
+                roleArn.equals(pair.roleArn()) && principalArn.equals(pair.principalArn()));
+        if (!rolePair) {
+            throw new AwsException("InvalidIdentityToken",
+                    "The SAML assertion does not contain the requested role and principal.", 400);
+        }
+
+        String callerAccountId = regionResolver.getAccountId();
+        String accountId = AwsArnUtils.accountOrDefault(roleArn, callerAccountId);
+        String roleName = roleArn.contains("/") ? roleArn.substring(roleArn.lastIndexOf('/') + 1) : "UnknownRole";
+        IamRole role = iamService.findRole(accountId, roleName).orElseThrow(() ->
+                new AwsException("AccessDenied", "Not authorized to perform sts:AssumeRoleWithSAML on resource: " + roleArn, 403));
+        if (!samlTrustEvaluator.allows(role.getAssumeRolePolicyDocument(), principalArn, Map.of(
+                "aud", List.of(STS_AUDIENCE),
+                "iss", List.of(verified.issuer()),
+                "sub", List.of(verified.subject()),
+                "namequalifier", List.of(verified.nameQualifier())))) {
+            throw new AwsException("AccessDenied", "Not authorized to perform sts:AssumeRoleWithSAML on resource: " + roleArn, 403);
+        }
+
+        String sessionName = verified.subject().replaceAll("[^A-Za-z0-9+=,.@_-]", "_");
+        if (sessionName.length() > 64) {
+            sessionName = sessionName.substring(0, 64);
+        }
+        Instant requestedExpiration = Instant.now().plusSeconds(durationSeconds);
+        Instant roleExpiration = Instant.now().plusSeconds(role.getMaxSessionDuration());
+        Instant expiration = verified.expiration().isBefore(requestedExpiration) ? verified.expiration() : requestedExpiration;
+        if (roleExpiration.isBefore(expiration)) {
+            expiration = roleExpiration;
+        }
         String accessKeyId = "ASIA" + randomId(16);
         String secretKey = randomSecret(40);
         String sessionToken = randomSecret(200);
-        Instant expiration = Instant.now().plusSeconds(durationSeconds);
-
-        String roleName = roleArn.contains("/") ? roleArn.substring(roleArn.lastIndexOf('/') + 1) : "UnknownRole";
-        String callerAccountId = regionResolver.getAccountId();
-        String accountId = AwsArnUtils.accountOrDefault(roleArn, callerAccountId);
         String assumedRoleArn = AwsArnUtils.Arn.of("sts", "", accountId, "assumed-role/" + roleName + "/" + sessionName).toString();
         String assumedRoleId = "AROA" + randomId(16) + ":" + sessionName;
 
-        iamService.registerSession(accessKeyId, secretKey, sessionToken, roleArn, expiration, null, callerAccountId);
-
+        iamService.registerSession(accessKeyId, secretKey, sessionToken, roleArn, expiration, null,
+                callerAccountId, sessionName, assumedRoleId);
         String result = new XmlBuilder()
                 .raw(credentialsXml(accessKeyId, secretKey, sessionToken, expiration))
-                .start("AssumedRoleUser")
-                  .elem("Arn", assumedRoleArn)
-                  .elem("AssumedRoleId", assumedRoleId)
-                .end("AssumedRoleUser")
-                .elem("PackedPolicySize", "0")
-                .elem("Issuer", "https://saml.example.com")
-                .elem("Audience", "urn:amazon:webservices")
-                .elem("NameQualifier", "saml-qualifier")
-                .elem("SubjectType", "persistent")
-                .elem("Subject", "saml-subject")
-                .build();
+                .start("AssumedRoleUser").elem("Arn", assumedRoleArn).elem("AssumedRoleId", assumedRoleId).end("AssumedRoleUser")
+                .elem("PackedPolicySize", "0").elem("Issuer", verified.issuer()).elem("Audience", "urn:amazon:webservices")
+                .elem("NameQualifier", verified.nameQualifier()).elem("SubjectType", verified.subjectType()).elem("Subject", verified.subject()).build();
         return Response.ok(AwsQueryResponse.envelope("AssumeRoleWithSAML", AwsNamespaces.STS, result)).build();
     }
 
@@ -367,6 +422,10 @@ public class StsQueryHandler {
         Response validation = validateRequired(params, "Name");
         if (validation != null) {
             return validation;
+        }
+        Response durationValidation = validateDurationSeconds(params, 900, 129600);
+        if (durationValidation != null) {
+            return durationValidation;
         }
         String name = getParam(params, "Name");
         int durationSeconds = getIntParam(params, "DurationSeconds", 43200);
@@ -419,6 +478,39 @@ public class StsQueryHandler {
         return null;
     }
 
+    /**
+     * Validates the optional {@code DurationSeconds} parameter against {@code minSeconds}/{@code maxSeconds}.
+     * Returns {@code null} when the parameter is absent or valid; otherwise a {@code ValidationError} (out of
+     * range) or {@code InvalidParameterValue} (not an integer) response, matching AWS's own wire behavior.
+     */
+    private Response validateDurationSeconds(MultivaluedMap<String, String> params, int minSeconds, int maxSeconds) {
+        String value = params.getFirst("DurationSeconds");
+        if (value == null) {
+            return null;
+        }
+        int durationSeconds;
+        try {
+            durationSeconds = Integer.parseInt(value);
+        } catch (NumberFormatException e) {
+            return AwsQueryResponse.error("InvalidParameterValue",
+                    "Value " + value + " for parameter DurationSeconds is invalid. Reason: Must be an integer.",
+                    AwsNamespaces.STS, 400);
+        }
+        if (durationSeconds < minSeconds) {
+            return AwsQueryResponse.error("ValidationError",
+                    "1 validation error detected: Value '" + durationSeconds + "' at 'durationSeconds' failed to "
+                            + "satisfy constraint: Member must have value greater than or equal to " + minSeconds,
+                    AwsNamespaces.STS, 400);
+        }
+        if (durationSeconds > maxSeconds) {
+            return AwsQueryResponse.error("ValidationError",
+                    "1 validation error detected: Value '" + durationSeconds + "' at 'durationSeconds' failed to "
+                            + "satisfy constraint: Member must have value less than or equal to " + maxSeconds,
+                    AwsNamespaces.STS, 400);
+        }
+        return null;
+    }
+
     private String credentialsXml(String accessKeyId, String secretKey, String sessionToken, Instant expiration) {
         return new XmlBuilder()
                 .start("Credentials")
@@ -457,10 +549,10 @@ public class StsQueryHandler {
         return sb.toString();
     }
 
-    private static String randomSecret(int length) {
+    private String randomSecret(int length) {
         StringBuilder sb = new StringBuilder(length);
         for (int i = 0; i < length; i++) {
-            sb.append(CHARS.charAt(ThreadLocalRandom.current().nextInt(CHARS.length())));
+            sb.append(CHARS.charAt(secureRandom.nextInt(CHARS.length())));
         }
         return sb.toString();
     }

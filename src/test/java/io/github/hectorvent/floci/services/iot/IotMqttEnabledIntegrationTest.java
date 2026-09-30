@@ -23,6 +23,7 @@ import java.time.Instant;
 import java.util.Arrays;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Random;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
@@ -31,12 +32,14 @@ import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.equalTo;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 @QuarkusTest
 @TestProfile(IotMqttEnabledIntegrationTest.EnabledMqttProfile.class)
 class IotMqttEnabledIntegrationTest {
 
+    static final int AWS_MAX_PAYLOAD = 128 * 1024;
     private static final int PORT = 18831;
     private static final String BROKER_URI = "tcp://127.0.0.1:" + PORT;
     private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
@@ -174,6 +177,79 @@ class IotMqttEnabledIntegrationTest {
         }
 
         awaitPublishedEvent(topic, payload);
+    }
+
+    @Test
+    void publishOfTheAwsMaximumPayloadIsDelivered() throws Exception {
+        String topic = "phase6/limit/" + System.nanoTime();
+        byte[] payload = randomPayload(AWS_MAX_PAYLOAD);
+
+        try (MqttTestClient subscriber = connectMqtt("limit-sub")) {
+            subscriber.subscribe(topic, 1);
+            try (MqttTestClient publisher = connectMqtt("limit-pub")) {
+                publisher.publish(topic, payload, 1);
+            }
+            assertArrayEquals(payload, subscriber.takePublish().payload());
+        }
+
+        awaitPublishedEvent(topic, payload);
+    }
+
+    @Test
+    void publishAboveTheAwsMaximumPayloadDisconnectsWithoutAckOrDelivery() throws Exception {
+        String topic = "phase6/over-limit/" + System.nanoTime();
+        byte[] after = "after".getBytes(StandardCharsets.UTF_8);
+
+        try (MqttTestClient subscriber = connectMqtt("over-limit-sub")) {
+            subscriber.subscribe(topic, 1);
+            try (MqttTestClient publisher = connectMqtt("over-limit-pub")) {
+                assertThrows(MqttException.class, () -> publisher.publish(topic, randomPayload(AWS_MAX_PAYLOAD + 1), 1));
+                publisher.awaitDisconnected();
+            }
+            try (MqttTestClient next = connectMqtt("over-limit-next")) {
+                next.publish(topic, after);
+            }
+            assertArrayEquals(after, subscriber.takePublish().payload(), "the oversized publish is never delivered");
+        }
+
+        awaitPublishedEvent(topic, after);
+        assertEquals(1, eventRecorder.recentEvents().stream().filter(event -> topic.equals(event.topic())).count(),
+                "the oversized publish reaches no rule");
+    }
+
+    @Test
+    void mqtt5PublishAtTheAwsPropertyAndPayloadMaximumsIsDelivered() throws Exception {
+        String topic = "phase6/mqtt5-limit/" + System.nanoTime();
+        byte[] payload = randomPayload(AWS_MAX_PAYLOAD);
+
+        try (Mqtt5TestClient subscriber = connectMqtt5("mqtt5-limit-sub")) {
+            subscriber.subscribe(topic);
+            try (Mqtt5TestClient publisher = connectMqtt5("mqtt5-limit-pub")) {
+                publisher.publish(topic, payload, 1, awsMaximumProperties(8 * 1024));
+            }
+            assertArrayEquals(payload, subscriber.takePublish().payload());
+        }
+    }
+
+    @Test
+    void mqtt5PublishAboveTheAwsPacketMaximumDisconnectsWithoutAck() throws Exception {
+        String topic = "phase6/mqtt5-over-limit/" + System.nanoTime();
+
+        try (Mqtt5TestClient publisher = connectMqtt5("mqtt5-over-limit-pub")) {
+            org.eclipse.paho.mqttv5.common.MqttException thrown = assertThrows(
+                    org.eclipse.paho.mqttv5.common.MqttException.class,
+                    () -> publisher.publish(topic, randomPayload(AWS_MAX_PAYLOAD), 1, awsMaximumProperties(16 * 1024)));
+            assertEquals(org.eclipse.paho.mqttv5.client.MqttClientException.REASON_CODE_CONNECTION_LOST, thrown.getReasonCode());
+        }
+    }
+
+    /** 8 KB correlation data plus user properties of the given key and value size, as AWS counts them. */
+    private static org.eclipse.paho.mqttv5.common.packet.MqttProperties awsMaximumProperties(int userPropertiesSize) {
+        org.eclipse.paho.mqttv5.common.packet.MqttProperties properties = new org.eclipse.paho.mqttv5.common.packet.MqttProperties();
+        properties.setCorrelationData(randomPayload(8 * 1024));
+        properties.setUserProperties(java.util.List.of(
+                new org.eclipse.paho.mqttv5.common.packet.UserProperty("k", "v".repeat(userPropertiesSize - 1))));
+        return properties;
     }
 
     @Test
@@ -354,6 +430,44 @@ class IotMqttEnabledIntegrationTest {
         }
     }
 
+    @Test
+    void clientidIsTheMqttClientThatPublishedTheMessage() throws Exception {
+        given()
+            .contentType("application/json")
+            .body("""
+                {
+                  "topicRulePayload": {
+                    "sql": "SELECT clientid() AS client, topic() AS topic FROM 'devices/phase8/mqtt/clientid'",
+                    "actions": [
+                      {
+                        "republish": {
+                          "roleArn": "arn:aws:iam::000000000000:role/iot-rule-role",
+                          "topic": "devices/phase8/mqtt/clientid-target"
+                        }
+                      }
+                    ]
+                  }
+                }
+                """)
+        .when()
+            .put("/rules/phase8MqttClientIdRule")
+        .then()
+            .statusCode(200);
+
+        try (MqttTestClient subscriber = connectMqtt("phase8-clientid-sub")) {
+            subscriber.subscribe("devices/phase8/mqtt/clientid-target");
+            String publisherId = uniqueClientId("phase8-clientid-pub");
+
+            try (MqttTestClient publisher = connectMqttClientId(publisherId)) {
+                publisher.publish("devices/phase8/mqtt/clientid", "{}".getBytes(StandardCharsets.UTF_8));
+            }
+
+            MqttPublish republished = subscriber.takePublish();
+            assertEquals("{\"client\":\"" + publisherId + "\",\"topic\":\"devices/phase8/mqtt/clientid\"}",
+                    new String(republished.payload(), StandardCharsets.UTF_8));
+        }
+    }
+
     private MqttTestClient connectMqtt(String clientId) throws MqttException {
         return connectMqttClientId(uniqueClientId(clientId));
     }
@@ -368,6 +482,12 @@ class IotMqttEnabledIntegrationTest {
 
     private Mqtt5TestClient connectMqtt5(String clientId) throws org.eclipse.paho.mqttv5.common.MqttException {
         return Mqtt5TestClient.connect(uniqueClientId(clientId));
+    }
+
+    static byte[] randomPayload(int size) {
+        byte[] payload = new byte[size];
+        new Random(size).nextBytes(payload);
+        return payload;
     }
 
     private byte[] json(String value) {
@@ -404,6 +524,7 @@ class IotMqttEnabledIntegrationTest {
 
         static MqttTestClient connect(String clientId) throws MqttException {
             MqttClient client = new MqttClient(BROKER_URI, clientId, new MemoryPersistence());
+            client.setTimeToWait(10_000);
             MqttTestClient testClient = new MqttTestClient(client);
             client.setCallback(new MqttCallback() {
                 @Override
@@ -456,7 +577,7 @@ class IotMqttEnabledIntegrationTest {
                 }
                 Thread.sleep(25);
             }
-            throw new AssertionError("MQTT connection stayed open after DeleteConnection");
+            throw new AssertionError("MQTT connection stayed open");
         }
 
         @Override
@@ -515,6 +636,7 @@ class IotMqttEnabledIntegrationTest {
                 public void authPacketArrived(int reasonCode, org.eclipse.paho.mqttv5.common.packet.MqttProperties properties) {
                 }
             });
+            client.setTimeToWait(10_000);
             client.connect(connectOptions());
             return testClient;
         }
@@ -528,8 +650,14 @@ class IotMqttEnabledIntegrationTest {
         }
 
         void publish(String topic, byte[] payload) throws org.eclipse.paho.mqttv5.common.MqttException {
+            publish(topic, payload, 0, new org.eclipse.paho.mqttv5.common.packet.MqttProperties());
+        }
+
+        void publish(String topic, byte[] payload, int qos, org.eclipse.paho.mqttv5.common.packet.MqttProperties properties)
+                throws org.eclipse.paho.mqttv5.common.MqttException {
             org.eclipse.paho.mqttv5.common.MqttMessage message = new org.eclipse.paho.mqttv5.common.MqttMessage(payload);
-            message.setQos(0);
+            message.setQos(qos);
+            message.setProperties(properties);
             client.publish(topic, message);
         }
 

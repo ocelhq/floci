@@ -25,6 +25,43 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
 ```
 
+The container normally switches to the unprivileged `floci` user (UID 1001), including when started with `--user root`. If the mounted socket is accessible only to root, set the entrypoint option `FLOCI_RUN_AS_ROOT=true` to keep Floci running as root:
+
+```bash
+docker run --rm -p 4566:4566 \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -e FLOCI_RUN_AS_ROOT=true \
+  floci/floci:latest
+```
+
+In Docker Compose, use the same environment variable:
+
+```yaml
+services:
+  floci:
+    image: floci/floci:latest
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      FLOCI_RUN_AS_ROOT: "true"
+```
+
+Use this only when the socket's permissions require root. Without the option, Floci retains its unprivileged default. The setting applies to the container entrypoint, not to `floci.docker` configuration.
+
+## Connection Pool
+
+Every Docker call Floci makes goes through one shared client with a bounded connection pool. Some of those connections stay open for as long as a container runs: each Lambda container holds two (its followed log stream and the watcher that notices its runtime exiting) plus one per Lambda extension, and other container-backed services hold one for their log stream. When those long-lived connections fill the pool, every other Docker call (create, start, stop, remove) waits for one to free up, and Floci stops making progress.
+
+The default of 1024 connections covers the 500 concurrent Lambda containers the default [Runtime API port range](../services/lambda.md#configuration) allows. Raise it if you widen that range or run many other containers at the same time:
+
+```yaml
+floci:
+  docker:
+    max-connections: 1024
+```
+
+Environment variable: `FLOCI_DOCKER_MAX_CONNECTIONS`
+
 ## Private Registry Authentication
 
 Any service that pulls a container image from a private registry (Lambda image functions, custom OpenSearch images, private Postgres images, etc.) needs Docker credentials. Two approaches are supported and can be combined.
@@ -172,6 +209,8 @@ Environment variable: `FLOCI_SERVICES_DOCKER_NETWORK`
 
 Individual services can override the network with their own `docker-network` setting (e.g. `floci.services.lambda.docker-network`).
 
+A network mode of `host`, `none` or `container:<id>` places the spawned containers in that network namespace instead of on a Docker network. Docker publishes no host ports there, so a container on the host network serves its own port directly on the host (an OpenSearch domain listens on `9200` rather than on a port from its configured range), and Floci reaches it via `localhost`. A container placed in another container's namespace (`container:<id>`) is reached through that container's address instead: its IP on the Docker network, or `localhost` when it is itself on the host network.
+
 !!! tip
     In Docker Compose, the default network name is `<project-name>_default`. If your compose file is in a directory named `myapp`, the network is `myapp_default`.
 
@@ -232,6 +271,7 @@ What each setting does and why it is needed:
 |---|---|---|
 | `FLOCI_DOCKER_DOCKER_HOST` | `unix:///var/run/docker.sock` | Docker daemon socket |
 | `FLOCI_DOCKER_DOCKER_CONFIG_PATH` | _(unset)_ | Path to directory containing Docker's `config.json` |
+| `FLOCI_DOCKER_MAX_CONNECTIONS` | `1024` | Connection pool size for Floci's Docker client. Each live Lambda container holds two connections, so about half this many can run at once |
 | `FLOCI_DOCKER_REGISTRY_CREDENTIALS_0__SERVER` | _(unset)_ | Registry hostname for credential entry 0 |
 | `FLOCI_DOCKER_REGISTRY_CREDENTIALS_0__USERNAME` | _(unset)_ | Username for credential entry 0 |
 | `FLOCI_DOCKER_REGISTRY_CREDENTIALS_0__PASSWORD` | _(unset)_ | Password for credential entry 0 |

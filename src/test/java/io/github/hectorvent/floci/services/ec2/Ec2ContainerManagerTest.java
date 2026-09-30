@@ -11,39 +11,54 @@ import com.github.dockerjava.api.command.InspectContainerResponse;
 import com.github.dockerjava.api.command.InspectExecCmd;
 import com.github.dockerjava.api.command.InspectExecResponse;
 import com.github.dockerjava.api.command.ListContainersCmd;
+import com.github.dockerjava.api.command.StartContainerCmd;
+import com.github.dockerjava.api.exception.DockerException;
 import com.github.dockerjava.api.model.Container;
+import com.github.dockerjava.api.model.ContainerConfig;
 import com.github.dockerjava.api.model.ContainerNetwork;
 import com.github.dockerjava.api.model.Frame;
+import com.github.dockerjava.api.model.HostConfig;
 import com.github.dockerjava.api.model.StreamType;
 import java.nio.charset.StandardCharsets;
 import com.github.dockerjava.api.model.NetworkSettings;
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.services.ec2.net.VpcNetworkManager;
 import io.github.hectorvent.floci.services.ec2.portforward.Ec2PortForwardManager;
 import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.common.dns.EmbeddedDnsServer;
 import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
 import io.github.hectorvent.floci.core.common.docker.ContainerDetector;
 import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager;
+import io.github.hectorvent.floci.core.common.docker.UserDataPipeline;
 import io.github.hectorvent.floci.core.common.docker.ContainerLogStreamer;
+import io.github.hectorvent.floci.core.common.docker.ContainerReachableEndpoint;
 import io.github.hectorvent.floci.core.common.docker.ContainerSpec;
 import io.github.hectorvent.floci.core.common.docker.DockerHostResolver;
 import io.github.hectorvent.floci.core.common.docker.PortAllocator;
 import io.github.hectorvent.floci.services.ec2.model.Instance;
 import io.github.hectorvent.floci.services.ec2.model.InstanceNetworkInterface;
 import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
 
 import java.io.InputStream;
+import java.io.Closeable;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.Optional;
+import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
@@ -56,12 +71,15 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.anySet;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Answers.RETURNS_SELF;
 import static org.mockito.Answers.RETURNS_DEEP_STUBS;
 import static org.mockito.Mockito.after;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.timeout;
 import static org.mockito.Mockito.times;
@@ -150,7 +168,9 @@ class Ec2ContainerManagerTest {
                 metadataServer,
                 mock(Ec2PortForwardManager.class),
                 mock(RegionResolver.class),
-                mock(ContainerNetworkReachability.class));
+                mock(ContainerNetworkReachability.class),
+                mock(VpcNetworkManager.class),
+                mock(ContainerReachableEndpoint.class));
 
         Instance instance = new Instance();
         instance.setInstanceId("i-restored");
@@ -166,8 +186,262 @@ class Ec2ContainerManagerTest {
     }
 
     @Test
+    void restoreMetadataRegistrationAlsoRegistersTheAddressImdsRequestsArriveFrom() {
+        ContainerLifecycleManager lifecycleManager = mock(ContainerLifecycleManager.class);
+        when(lifecycleManager.isContainerRunning(TEST_CONTAINER_ID)).thenReturn(true);
+
+        DockerClient dockerClient = mock(DockerClient.class);
+        InspectContainerResponse response = vpcAttachedInspectResponse("10.0.1.10", "172.17.0.4");
+        InspectContainerCmd inspect = mock(InspectContainerCmd.class);
+        when(dockerClient.inspectContainerCmd(TEST_CONTAINER_ID)).thenReturn(inspect);
+        when(inspect.exec()).thenReturn(response);
+
+        Ec2MetadataServer metadataServer = mock(Ec2MetadataServer.class);
+        Ec2ContainerManager manager = managerWith(lifecycleManager, dockerClient, metadataServer);
+
+        Instance instance = new Instance();
+        instance.setInstanceId("i-vpc-restored");
+        instance.setDockerContainerId(TEST_CONTAINER_ID);
+        instance.setContainerBridgeIp("10.0.1.10");
+        instance.setImdsSourceIp("172.17.0.2");
+
+        assertTrue(manager.restoreMetadataRegistration(instance));
+
+        // The VPC address is what Floci reports, but the container's default route is the bridge,
+        // so that is the source address Ec2MetadataServer resolves the instance by.
+        verify(metadataServer).registerContainer("10.0.1.10", "i-vpc-restored", instance);
+        verify(metadataServer).registerContainer("172.17.0.4", "i-vpc-restored", instance);
+        verify(metadataServer).unregisterContainer("172.17.0.2", instance);
+        assertEquals("172.17.0.4", instance.getImdsSourceIp());
+    }
+
+    @Test
+    void restoreRegistersAllNetworksAndReplacesStaleSharedAddress() {
+        for (boolean sharedFirst : List.of(true, false)) {
+            ContainerLifecycleManager lifecycle = mock(ContainerLifecycleManager.class);
+            when(lifecycle.isContainerRunning(TEST_CONTAINER_ID)).thenReturn(true);
+            DockerClient docker = mock(DockerClient.class);
+            InspectContainerCmd command = mock(InspectContainerCmd.class);
+            when(docker.inspectContainerCmd(TEST_CONTAINER_ID)).thenReturn(command);
+            InspectContainerResponse response = mock(InspectContainerResponse.class);
+            NetworkSettings settings = mock(NetworkSettings.class);
+            when(response.getNetworkSettings()).thenReturn(settings);
+            Map<String, ContainerNetwork> networks = new LinkedHashMap<>();
+            networks.put("bridge", new ContainerNetwork().withIpv4Address("172.17.0.4"));
+            String first = sharedFirst ? "shared" : "vpc";
+            String second = sharedFirst ? "vpc" : "shared";
+            networks.put(first, new ContainerNetwork().withIpv4Address(sharedFirst ? "192.0.2.10" : "10.0.1.10"));
+            networks.put(second, new ContainerNetwork().withIpv4Address(sharedFirst ? "10.0.1.10" : "192.0.2.10"));
+            when(settings.getNetworks()).thenReturn(networks);
+            when(command.exec()).thenReturn(response);
+            Ec2MetadataServer server = new Ec2MetadataServer(null, null, null);
+            Ec2ContainerManager manager = managerWith(lifecycle, docker, server);
+            Instance guest = instance("i-multinetwork");
+            guest.setDockerContainerId(TEST_CONTAINER_ID);
+            server.registerContainer("192.0.2.9", guest.getInstanceId(), guest);
+
+            assertTrue(manager.restoreMetadataRegistration(guest));
+
+            for (String address : List.of("172.17.0.4", "10.0.1.10", "192.0.2.10")) {
+                assertEquals(guest, server.registeredContainer(address).orElseThrow());
+            }
+            assertTrue(server.registeredContainer("192.0.2.9").isEmpty());
+        }
+    }
+
+    @Test
+    void restoreMetadataRegistrationLeavesABridgeOnlyInstanceWithNoSeparateImdsSource() {
+        ContainerLifecycleManager lifecycleManager = mock(ContainerLifecycleManager.class);
+        when(lifecycleManager.isContainerRunning(TEST_CONTAINER_ID)).thenReturn(true);
+
+        DockerClient dockerClient = mock(DockerClient.class);
+        InspectContainerResponse response = inspectResponse("172.17.0.4");
+        InspectContainerCmd inspect = mock(InspectContainerCmd.class);
+        when(dockerClient.inspectContainerCmd(TEST_CONTAINER_ID)).thenReturn(inspect);
+        when(inspect.exec()).thenReturn(response);
+
+        Ec2MetadataServer metadataServer = mock(Ec2MetadataServer.class);
+        Ec2ContainerManager manager = managerWith(lifecycleManager, dockerClient, metadataServer);
+
+        Instance instance = new Instance();
+        instance.setInstanceId("i-bridge-only");
+        instance.setDockerContainerId(TEST_CONTAINER_ID);
+        instance.setContainerBridgeIp("172.17.0.4");
+
+        assertTrue(manager.restoreMetadataRegistration(instance));
+
+        assertNull(instance.getImdsSourceIp(), "one address means one registration");
+        verify(metadataServer).registerContainer("172.17.0.4", "i-bridge-only", instance);
+        verify(metadataServer, never()).unregisterContainer(anyString(), any(Instance.class));
+    }
+
+    @Test
+    void restoreMetadataRegistrationKeepsTheImdsSourceWhenTheContainerCannotBeInspected() {
+        ContainerLifecycleManager lifecycleManager = mock(ContainerLifecycleManager.class);
+        when(lifecycleManager.isContainerRunning(TEST_CONTAINER_ID)).thenReturn(true);
+
+        DockerClient dockerClient = mock(DockerClient.class);
+        InspectContainerCmd inspect = mock(InspectContainerCmd.class);
+        when(dockerClient.inspectContainerCmd(TEST_CONTAINER_ID)).thenReturn(inspect);
+        when(inspect.exec()).thenThrow(new DockerException("dial unix /var/run/docker.sock: EOF", 500));
+
+        Ec2MetadataServer metadataServer = mock(Ec2MetadataServer.class);
+        Ec2ContainerManager manager = managerWith(lifecycleManager, dockerClient, metadataServer);
+
+        Instance instance = new Instance();
+        instance.setInstanceId("i-inspect-failed");
+        instance.setDockerContainerId(TEST_CONTAINER_ID);
+        instance.setContainerBridgeIp("10.0.1.10");
+        instance.setImdsSourceIp("172.17.0.4");
+
+        assertTrue(manager.restoreMetadataRegistration(instance));
+
+        // A failed inspect leaves the bridge attachment unknown, not known to be absent. Tearing
+        // the registration down here would stop this healthy instance's metadata requests
+        // resolving, with nothing registered in place of what was removed.
+        verify(metadataServer, never()).unregisterContainer("172.17.0.4", instance);
+        verify(metadataServer, never()).reconcileContainerAddresses(anySet(), any());
+        assertEquals("172.17.0.4", instance.getImdsSourceIp(),
+                "a transient Docker failure must not drop an existing IMDS source registration");
+    }
+
+    @Test
+    void startRegistersTheNewBridgeAddressDockerHandsOutOnRestart() throws Exception {
+        ContainerLifecycleManager lifecycleManager = mock(ContainerLifecycleManager.class);
+        when(lifecycleManager.isContainerRunning(TEST_CONTAINER_ID)).thenReturn(true);
+
+        DockerClient dockerClient = mock(DockerClient.class);
+        when(dockerClient.startContainerCmd(TEST_CONTAINER_ID))
+                .thenReturn(mock(StartContainerCmd.class, RETURNS_SELF));
+        // The VPC address is static, so it survives the stop; the bridge address does not.
+        InspectContainerResponse response = vpcAttachedInspectResponse("10.0.1.10", "172.17.0.9");
+        InspectContainerCmd inspect = mock(InspectContainerCmd.class);
+        when(dockerClient.inspectContainerCmd(TEST_CONTAINER_ID)).thenReturn(inspect);
+        when(inspect.exec()).thenReturn(response);
+
+        Ec2MetadataServer metadataServer = mock(Ec2MetadataServer.class);
+        Ec2ContainerManager manager = managerWith(lifecycleManager, dockerClient, metadataServer);
+
+        Instance instance = new Instance();
+        instance.setInstanceId("i-vpc-started");
+        instance.setDockerContainerId(TEST_CONTAINER_ID);
+        instance.setContainerBridgeIp("10.0.1.10");
+        instance.setImdsSourceIp("172.17.0.4");
+
+        manager.start(instance);
+        awaitUntil(() -> "running".equals(instance.getState().getName()), Duration.ofSeconds(5));
+
+        verify(metadataServer, timeout(2000)).registerContainer("172.17.0.9", "i-vpc-started", instance);
+        verify(metadataServer, timeout(2000)).unregisterContainer("172.17.0.4", instance);
+        verify(metadataServer, timeout(2000)).reconcileContainerAddresses(
+                Set.of("10.0.1.10", "172.17.0.9"), instance);
+        assertEquals("172.17.0.9", instance.getImdsSourceIp(),
+                "the stale address would otherwise stay registered while IMDS requests arrive "
+                        + "from an address nothing knows about");
+    }
+
+    @Test
+    void startOfAProtectedInstanceReusesTheHelperTransportAddress() throws Exception {
+        ContainerLifecycleManager lifecycleManager = mock(ContainerLifecycleManager.class);
+        when(lifecycleManager.isContainerRunning(TEST_CONTAINER_ID)).thenReturn(true);
+
+        DockerClient dockerClient = mock(DockerClient.class);
+        when(dockerClient.startContainerCmd(TEST_CONTAINER_ID))
+                .thenReturn(mock(StartContainerCmd.class, RETURNS_SELF));
+        // A workload in the helper's namespace has no Docker attachment of its own, so there is
+        // no bridge address on it to rediscover after the restart.
+        InspectContainerResponse workload = mock(InspectContainerResponse.class);
+        HostConfig hostConfig = mock(HostConfig.class);
+        when(hostConfig.getNetworkMode()).thenReturn("container:helper-1");
+        when(workload.getHostConfig()).thenReturn(hostConfig);
+        InspectContainerCmd inspectWorkload = mock(InspectContainerCmd.class);
+        when(inspectWorkload.exec()).thenReturn(workload);
+        when(dockerClient.inspectContainerCmd(TEST_CONTAINER_ID)).thenReturn(inspectWorkload);
+
+        InspectContainerResponse helper = mock(InspectContainerResponse.class);
+        ContainerConfig helperConfig = mock(ContainerConfig.class);
+        when(helperConfig.getLabels()).thenReturn(Map.of(
+                "floci.security-group-helper", "true",
+                "io.floci.service", "ec2",
+                "io.floci.resource-id", "i-protected",
+                "floci_owner_port", "4566"));
+        when(helper.getConfig()).thenReturn(helperConfig);
+        NetworkSettings helperNetworks = mock(NetworkSettings.class);
+        when(helperNetworks.getNetworks())
+                .thenReturn(Map.of("bridge", new ContainerNetwork().withIpv4Address("172.17.0.7")));
+        when(helper.getNetworkSettings()).thenReturn(helperNetworks);
+        InspectContainerCmd inspectHelper = mock(InspectContainerCmd.class);
+        when(inspectHelper.exec()).thenReturn(helper);
+        when(dockerClient.inspectContainerCmd("helper-1")).thenReturn(inspectHelper);
+
+        EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        when(config.port()).thenReturn(4566);
+        when(config.docker().resourceNamespace()).thenReturn(Optional.empty());
+
+        Ec2MetadataServer metadataServer = mock(Ec2MetadataServer.class);
+        Ec2ContainerManager manager = new Ec2ContainerManager(
+                mock(ContainerBuilder.class),
+                lifecycleManager,
+                mock(ContainerLogStreamer.class),
+                mock(ContainerDetector.class),
+                mock(DockerHostResolver.class),
+                dockerClient,
+                mock(PortAllocator.class),
+                config,
+                metadataServer,
+                mock(Ec2PortForwardManager.class),
+                mock(RegionResolver.class),
+                mock(ContainerNetworkReachability.class),
+                mock(VpcNetworkManager.class),
+                mock(ContainerReachableEndpoint.class),
+                mock(SecurityGroupFirewallManager.class));
+
+        Instance instance = new Instance();
+        instance.setInstanceId("i-protected");
+        instance.setDockerContainerId(TEST_CONTAINER_ID);
+
+        manager.start(instance);
+        awaitUntil(() -> "running".equals(instance.getState().getName()), Duration.ofSeconds(5));
+
+        verify(metadataServer, timeout(2000)).registerContainer("172.17.0.7", "i-protected", instance);
+        assertEquals("172.17.0.7", instance.getContainerBridgeIp(),
+                "StartInstances must keep addressing the instance through its protected namespace");
+    }
+
+    private static Ec2ContainerManager managerWith(ContainerLifecycleManager lifecycleManager,
+                                                   DockerClient dockerClient,
+                                                   Ec2MetadataServer metadataServer) {
+        return new Ec2ContainerManager(
+                mock(ContainerBuilder.class),
+                lifecycleManager,
+                mock(ContainerLogStreamer.class),
+                mock(ContainerDetector.class),
+                mock(DockerHostResolver.class),
+                dockerClient,
+                mock(PortAllocator.class),
+                mock(EmulatorConfig.class, RETURNS_DEEP_STUBS),
+                metadataServer,
+                mock(Ec2PortForwardManager.class),
+                mock(RegionResolver.class),
+                mock(ContainerNetworkReachability.class),
+                mock(VpcNetworkManager.class),
+                mock(ContainerReachableEndpoint.class));
+    }
+
+    /** A container on both its VPC network and the default bridge, which is what launch leaves. */
+    private static InspectContainerResponse vpcAttachedInspectResponse(String vpcIp, String bridgeIp) {
+        InspectContainerResponse inspect = mock(InspectContainerResponse.class);
+        NetworkSettings networkSettings = mock(NetworkSettings.class);
+        when(inspect.getNetworkSettings()).thenReturn(networkSettings);
+        when(networkSettings.getNetworks()).thenReturn(Map.of(
+                "floci-vpc-4566-us-west-2-vpc-1", new ContainerNetwork().withIpv4Address(vpcIp),
+                "bridge", new ContainerNetwork().withIpv4Address(bridgeIp)));
+        return inspect;
+    }
+
+    @Test
     void userDataExecutionCommandRunsScriptDirectlySoShebangIsHonored() {
-        assertArrayEquals(new String[]{"/tmp/user-data.sh"}, Ec2ContainerManager.userDataExecutionCommand());
+        assertArrayEquals(new String[]{"/var/lib/user-data.sh"}, Ec2ContainerManager.userDataExecutionCommand());
     }
 
     @Test
@@ -303,7 +577,7 @@ class Ec2ContainerManagerTest {
         int concurrentLaunches = 12;
         AtomicInteger active = new AtomicInteger(0);
         AtomicInteger peakActive = new AtomicInteger(0);
-        Ec2ContainerManager.userDataDecompressionTestHook = () -> {
+        UserDataPipeline.userDataDecompressionTestHook = () -> {
             int now = active.incrementAndGet();
             peakActive.accumulateAndGet(now, Math::max);
             try {
@@ -331,7 +605,7 @@ class Ec2ContainerManagerTest {
             }
         } finally {
             pool.shutdownNow();
-            Ec2ContainerManager.userDataDecompressionTestHook = null;
+            UserDataPipeline.userDataDecompressionTestHook = null;
         }
 
         assertEquals(concurrentLaunches, results.size());
@@ -415,7 +689,9 @@ class Ec2ContainerManagerTest {
                 mock(Ec2MetadataServer.class),
                 mock(Ec2PortForwardManager.class),
                 mock(RegionResolver.class),
-                reachability);
+                reachability,
+                mock(VpcNetworkManager.class),
+                mock(ContainerReachableEndpoint.class));
     }
 
     @Test
@@ -433,6 +709,53 @@ class Ec2ContainerManagerTest {
                 """;
 
         assertTrue(Ec2ContainerManager.userDataShellScripts(userData).isEmpty());
+    }
+
+    @Test
+    void launchReturnsTheLeaseWhenTheContainerNeverJoinsTheVpcNetwork() throws Exception {
+        Ec2ContainerManager.containerBridgeIpAttempts = 2;
+        Ec2ContainerManager.containerBridgeIpPollMillis = 1;
+        LaunchHarness harness = launchHarness();
+        InspectContainerResponse noIp = inspectResponse(null);
+        InspectContainerCmd inspect = mock(InspectContainerCmd.class);
+        when(harness.dockerClient.inspectContainerCmd(TEST_CONTAINER_ID)).thenReturn(inspect);
+        when(inspect.exec()).thenReturn(noIp);
+        // attach() returns empty: nothing holds the address, and the instance is about to start
+        // reporting its bridge address instead, so the lease is no longer findable from it.
+
+        Instance instance = leasedInstance("i-noattach");
+
+        harness.manager.launch(instance, "ubuntu:24.04", null, "us-west-2");
+
+        awaitUntil(() -> "terminated".equals(instance.getState().getName()), Duration.ofSeconds(2));
+        verify(harness.vpcNetworkManager, timeout(2000).atLeastOnce())
+                .releasePrivateIp("us-west-2", "subnet-lease", "10.0.1.10");
+    }
+
+    @Test
+    void launchReturnsTheLeaseWhenTheLaunchThrows() throws Exception {
+        LaunchHarness harness = launchHarness();
+        when(harness.builder.build()).thenThrow(new IllegalStateException("daemon went away"));
+
+        Instance instance = leasedInstance("i-throws");
+
+        harness.manager.launch(instance, "ubuntu:24.04", null, "us-west-2");
+
+        awaitUntil(() -> "terminated".equals(instance.getState().getName()), Duration.ofSeconds(2));
+        // Detach before release: Docker holds the address while the endpoint stands, so handing it
+        // to the next launch before disconnecting would have the daemon refuse it.
+        verify(harness.vpcNetworkManager, timeout(2000)).detach("us-west-2", "vpc-lease", null);
+        verify(harness.vpcNetworkManager, timeout(2000))
+                .releasePrivateIp("us-west-2", "subnet-lease", "10.0.1.10");
+    }
+
+    private static Instance leasedInstance(String instanceId) {
+        Instance instance = instance(instanceId);
+        instance.setRegion("us-west-2");
+        instance.setVpcId("vpc-lease");
+        instance.setSubnetId("subnet-lease");
+        instance.setPrivateIpAddress("10.0.1.10");
+        return instance;
     }
 
     @Test
@@ -549,6 +872,22 @@ class Ec2ContainerManagerTest {
     }
 
     @Test
+    void metadataProxyInstallCommandLetsDnfReplaceCurlMinimalWithCurl() {
+        // public.ecr.aws/amazonlinux/amazonlinux:2023 -- the fallback image AmiImageResolver
+        // uses for any unrecognized AMI ID -- ships curl-minimal by default. Without
+        // --allowerasing, "dnf install -y iproute socat curl ca-certificates" fails the whole
+        // transaction on a curl/curl-minimal conflict (they both provide /usr/bin/curl), so
+        // iproute and socat never install either, even though neither of them conflicts with
+        // anything. Reproduced against the real image: dnf reported dozens of
+        // "package curl-minimal-... conflicts with curl provided by curl-..." lines and the
+        // instance was left with no link-local IMDS endpoint.
+        String script = Ec2ContainerManager.metadataProxyInstallCommand()[2];
+
+        assertTrue(script.contains("dnf install -y --allowerasing iproute socat curl ca-certificates"),
+                script);
+    }
+
+    @Test
     void metadataProxyStartCommandBindsAwsLinkLocalMetadataAddress() {
         String[] command = Ec2ContainerManager.metadataProxyStartCommand("floci", 9169);
 
@@ -557,6 +896,16 @@ class Ec2ContainerManagerTest {
         assertTrue(command[2].contains("TCP-LISTEN:80,bind=169.254.169.254"));
         assertTrue(command[2].contains("TCP:floci:9169"));
         assertTrue(command[2].contains("http://169.254.169.254/latest/meta-data/instance-id"));
+    }
+
+    @Test
+    void instanceProfileEnvironmentLetsTheSdkUseImds() {
+        List<String> environment = Ec2ContainerManager.localAwsEnvironment(
+                "us-west-2", "http://floci:4566", "http://floci:9169", true);
+        assertTrue(environment.contains("AWS_EC2_METADATA_SERVICE_ENDPOINT=http://floci:9169"));
+        assertTrue(environment.contains("AWS_ENDPOINT_URL=http://floci:4566"));
+        assertFalse(environment.stream().anyMatch(value -> value.startsWith("AWS_ACCESS_KEY_ID=")
+                || value.startsWith("AWS_SECRET_ACCESS_KEY=") || value.startsWith("AWS_SESSION_TOKEN=")));
     }
 
     @Test
@@ -574,6 +923,31 @@ class Ec2ContainerManagerTest {
                         "us-west-2",
                         "http://floci:4566",
                         "http://floci:9169"));
+    }
+
+    @Test
+    void launchPointsTheInstanceSdkAtTheSharedContainerEndpointAndKeepsImdsOnTheHostAddress() throws Exception {
+        Ec2ContainerManager.containerBridgeIpAttempts = 1;
+        Ec2ContainerManager.containerBridgeIpPollMillis = 1;
+        LaunchHarness harness = launchHarness();
+        InspectContainerCmd inspect = mock(InspectContainerCmd.class);
+        InspectContainerResponse withIp = inspectResponse("172.18.0.13");
+        when(harness.dockerClient.inspectContainerCmd(TEST_CONTAINER_ID)).thenReturn(inspect);
+        when(inspect.exec()).thenReturn(withIp);
+        harness.stubSuccessfulExecs(new CountDownLatch(0), new CountDownLatch(0));
+        Instance instance = instance("i-endpoint");
+
+        harness.manager.launch(instance, "ubuntu:24.04", null, "us-west-2");
+
+        awaitUntil(() -> "running".equals(instance.getState().getName()), Duration.ofSeconds(2));
+        verify(harness.builder).withEnv(List.of(
+                "AWS_EC2_METADATA_SERVICE_ENDPOINT=http://floci:9169",
+                "AWS_ENDPOINT_URL=http://localhost.floci.io:4680",
+                "AWS_DEFAULT_REGION=us-west-2",
+                "AWS_REGION=us-west-2",
+                "AWS_ACCESS_KEY_ID=test",
+                "AWS_SECRET_ACCESS_KEY=test",
+                "AWS_SESSION_TOKEN=test-session-token"));
     }
 
     @Test
@@ -635,6 +1009,26 @@ class Ec2ContainerManagerTest {
     }
 
     @Test
+    void launchRegistersAllGuestAddressesBeforeUserData() throws Exception {
+        LaunchHarness harness = launchHarness();
+        InspectContainerCmd command = mock(InspectContainerCmd.class);
+        InspectContainerResponse response = vpcAttachedInspectResponse("10.0.1.10", "172.17.0.4");
+        Map<String, ContainerNetwork> networks = new LinkedHashMap<>(response.getNetworkSettings().getNetworks());
+        networks.put("shared", new ContainerNetwork().withIpv4Address("192.0.2.10"));
+        when(response.getNetworkSettings().getNetworks()).thenReturn(networks);
+        when(harness.dockerClient.inspectContainerCmd(TEST_CONTAINER_ID)).thenReturn(command);
+        when(command.exec()).thenReturn(response);
+        harness.stubSuccessfulExecs(new CountDownLatch(0), new CountDownLatch(0));
+        Instance guest = instance("i-three-networks");
+
+        harness.manager.launch(guest, "ubuntu:24.04", null, "us-west-2");
+
+        awaitUntil(() -> "running".equals(guest.getState().getName()), Duration.ofSeconds(2));
+        verify(harness.metadataServer).reconcileContainerAddresses(
+                Set.of("10.0.1.10", "172.17.0.4", "192.0.2.10"), guest);
+    }
+
+    @Test
     void launchWaitsForContainerBridgeIpBeforeRegisteringImds() throws Exception {
         Ec2ContainerManager.containerBridgeIpAttempts = 3;
         Ec2ContainerManager.containerBridgeIpPollMillis = 1;
@@ -654,7 +1048,7 @@ class Ec2ContainerManagerTest {
         assertEquals(TEST_CONTAINER_ID, instance.getDockerContainerId());
         assertEquals("172.18.0.9", instance.getContainerBridgeIp());
         assertEquals("172.18.0.9", instance.getPrivateIpAddress());
-        verify(inspect, times(2)).exec();
+        verify(inspect, times(3)).exec();
         verify(harness.metadataServer).registerContainer("172.18.0.9", "i-waitip", instance);
     }
 
@@ -810,6 +1204,111 @@ class Ec2ContainerManagerTest {
     }
 
     @Test
+    void userDataIsCopiedAndExecutedOutsideGuestTemporaryMounts() throws Exception {
+        LaunchHarness harness = launchHarness();
+        InspectContainerCmd inspect = mock(InspectContainerCmd.class);
+        when(harness.dockerClient.inspectContainerCmd(TEST_CONTAINER_ID)).thenReturn(inspect);
+        InspectContainerResponse withIp = inspectResponse("172.18.0.10");
+        when(inspect.exec()).thenReturn(withIp);
+        CountDownLatch userDataStarted = new CountDownLatch(1);
+        harness.stubSuccessfulExecs(userDataStarted, new CountDownLatch(0));
+        CopyArchiveToContainerCmd copy = harness.dockerClient.copyArchiveToContainerCmd(TEST_CONTAINER_ID);
+        Instance instance = instance("i-userdata-persistent-path");
+        instance.setUserData("#!/bin/sh\necho ready\n");
+
+        harness.manager.launch(instance, "amazonlinux:2023", null, "us-west-2");
+
+        assertTrue(userDataStarted.await(2, TimeUnit.SECONDS), "user data should start");
+        verify(copy).withRemotePath("/var/lib");
+        verify(copy, never()).withRemotePath("/tmp");
+        assertTrue(harness.executedCommands.stream()
+                .anyMatch(command -> Arrays.equals(command, new String[]{"/var/lib/user-data.sh"})));
+    }
+
+    @Test
+    void launchAppliesBackpressureWhenDockerLaunchesAreSaturated() throws Exception {
+        ThreadPoolExecutor launchExecutor = new ThreadPoolExecutor(
+                1, 1, 0, TimeUnit.MILLISECONDS, new ArrayBlockingQueue<>(1),
+                Ec2ContainerManager.BLOCKING_BACKPRESSURE);
+        LaunchHarness harness = launchHarness(launchExecutor, Duration.ofSeconds(1));
+        ExecutorService callerExecutor = Executors.newSingleThreadExecutor();
+        CountDownLatch createEntered = new CountDownLatch(1);
+        CountDownLatch releaseCreate = new CountDownLatch(1);
+        when(harness.lifecycleManager().create(any(ContainerSpec.class))).thenAnswer(invocation -> {
+            createEntered.countDown();
+            releaseCreate.await(2, TimeUnit.SECONDS);
+            throw new RuntimeException("test launch failure");
+        });
+
+        try {
+            harness.manager().launch(instance("i-backpressure-1"), "ubuntu:24.04", null, "us-west-2");
+            harness.manager().launch(instance("i-backpressure-2"), "ubuntu:24.04", null, "us-west-2");
+            Future<?> waitingLaunch = callerExecutor.submit(() ->
+                    harness.manager().launch(instance("i-backpressure-3"), "ubuntu:24.04", null, "us-west-2"));
+
+            assertTrue(createEntered.await(2, TimeUnit.SECONDS), "worker launch should enter Docker launch");
+            assertFalse(waitingLaunch.isDone(), "saturated launch should wait for queue capacity");
+
+            releaseCreate.countDown();
+            waitingLaunch.get(2, TimeUnit.SECONDS);
+        } finally {
+            releaseCreate.countDown();
+            harness.manager().stop();
+            callerExecutor.shutdownNow();
+            launchExecutor.shutdownNow();
+        }
+    }
+
+    @Test
+    void userDataTimeoutClosesDockerExecStream() throws Exception {
+        LaunchHarness harness = launchHarness(new ThreadPoolExecutor(
+                1, 1, 0, TimeUnit.MILLISECONDS, new ArrayBlockingQueue<>(1),
+                new ThreadPoolExecutor.CallerRunsPolicy()), Duration.ofMillis(50));
+        Ec2ContainerManager.containerBridgeIpAttempts = 1;
+        Ec2ContainerManager.containerBridgeIpPollMillis = 1;
+        InspectContainerCmd inspect = mock(InspectContainerCmd.class);
+        when(harness.dockerClient().inspectContainerCmd(TEST_CONTAINER_ID)).thenReturn(inspect);
+        InspectContainerResponse withIp = inspectResponse("172.18.0.30");
+        when(inspect.exec()).thenReturn(withIp);
+        Closeable stream = mock(Closeable.class);
+        CountDownLatch userDataStarted = new CountDownLatch(1);
+        stubUserDataCallback(harness, stream, userDataStarted);
+        Instance instance = instance("i-userdata-timeout");
+        instance.setUserData("#!/bin/sh\necho ready\n");
+
+        try {
+            harness.manager().launch(instance, "ubuntu:24.04", null, "us-west-2");
+            assertTrue(userDataStarted.await(2, TimeUnit.SECONDS), "user data should start");
+            verify(stream, timeout(2_000)).close();
+        } finally {
+            harness.manager().stop();
+        }
+    }
+
+    @Test
+    void shutdownClosesActiveUserDataExecStream() throws Exception {
+        LaunchHarness harness = launchHarness();
+        Ec2ContainerManager.containerBridgeIpAttempts = 1;
+        Ec2ContainerManager.containerBridgeIpPollMillis = 1;
+        InspectContainerCmd inspect = mock(InspectContainerCmd.class);
+        when(harness.dockerClient().inspectContainerCmd(TEST_CONTAINER_ID)).thenReturn(inspect);
+        InspectContainerResponse withIp = inspectResponse("172.18.0.31");
+        when(inspect.exec()).thenReturn(withIp);
+        Closeable stream = mock(Closeable.class);
+        CountDownLatch userDataStarted = new CountDownLatch(1);
+        stubUserDataCallback(harness, stream, userDataStarted);
+        Instance instance = instance("i-userdata-shutdown");
+        instance.setUserData("#!/bin/sh\necho ready\n");
+
+        harness.manager().launch(instance, "ubuntu:24.04", null, "us-west-2");
+        assertTrue(userDataStarted.await(2, TimeUnit.SECONDS), "user data should start");
+
+        harness.manager().stop();
+
+        verify(stream, timeout(2_000)).close();
+    }
+
+    @Test
     void launchCreatesSshdPrivilegeSeparationDirectoryBeforeStartingSshd() throws Exception {
         Ec2ContainerManager.containerBridgeIpAttempts = 1;
         Ec2ContainerManager.containerBridgeIpPollMillis = 1;
@@ -831,6 +1330,68 @@ class Ec2ContainerManagerTest {
         assertTrue(mkdirIndex < sshdIndex,
                 "/run/sshd must be created before sshd starts, otherwise sshd exits with "
                         + "\"Missing privilege separation directory\"");
+    }
+
+    @Test
+    void anAttachStreamErrorOnOneSshdPathStillTriesTheNext() throws Exception {
+        LaunchHarness harness = launchHarness();
+        InspectContainerCmd inspect = mock(InspectContainerCmd.class);
+        InspectContainerResponse withIp = inspectResponse("172.18.0.21");
+        when(harness.dockerClient.inspectContainerCmd(TEST_CONTAINER_ID)).thenReturn(inspect);
+        when(inspect.exec()).thenReturn(withIp);
+        harness.stubSuccessfulExecs(new CountDownLatch(0), new CountDownLatch(0));
+        doAnswer(invocation -> {
+            ExecStartCmd execStart = mock(ExecStartCmd.class);
+            when(execStart.exec(any())).thenAnswer(startInvocation -> {
+                ResultCallback<Frame> callback = startInvocation.getArgument(0);
+                String[] command = harness.executedCommands.get(harness.executedCommands.size() - 1);
+                if (Arrays.equals(command, new String[]{"/usr/sbin/sshd"})) {
+                    callback.onError(new IllegalStateException("attach stream broke"));
+                } else {
+                    callback.onComplete();
+                }
+                return callback;
+            });
+            return execStart;
+        }).when(harness.dockerClient).execStartCmd(anyString());
+
+        harness.manager.launch(instance("i-sshd-retry"), "ubuntu:24.04", null, "us-west-2");
+
+        awaitUntil(() -> commandIndex(harness.executedCommands, "/usr/local/sbin/sshd") >= 0, Duration.ofSeconds(2));
+        assertTrue(commandIndex(harness.executedCommands, "/usr/sbin/sshd")
+                < commandIndex(harness.executedCommands, "/usr/local/sbin/sshd"));
+    }
+
+    @Test
+    void anInterruptWhileStartingSshdStopsTryingFurtherSshdPaths() throws Exception {
+        LaunchHarness harness = launchHarness();
+        InspectContainerCmd inspect = mock(InspectContainerCmd.class);
+        InspectContainerResponse withIp = inspectResponse("172.18.0.22");
+        when(harness.dockerClient.inspectContainerCmd(TEST_CONTAINER_ID)).thenReturn(inspect);
+        when(inspect.exec()).thenReturn(withIp);
+        harness.stubSuccessfulExecs(new CountDownLatch(0), new CountDownLatch(0));
+        doAnswer(invocation -> {
+            ExecStartCmd execStart = mock(ExecStartCmd.class);
+            when(execStart.exec(any())).thenAnswer(startInvocation -> {
+                ResultCallback<Frame> callback = startInvocation.getArgument(0);
+                String[] command = harness.executedCommands.get(harness.executedCommands.size() - 1);
+                if (Arrays.equals(command, new String[]{"/usr/sbin/sshd"})) {
+                    Thread.currentThread().interrupt();
+                } else {
+                    callback.onComplete();
+                }
+                return callback;
+            });
+            return execStart;
+        }).when(harness.dockerClient).execStartCmd(anyString());
+        Instance instance = instance("i-sshd-interrupted");
+        instance.setUserData("#!/bin/sh\necho ready\n");
+
+        harness.manager.launch(instance, "ubuntu:24.04", null, "us-west-2");
+
+        // UserData is the next step after sshd, so its exec marks sshd startup as finished.
+        awaitUntil(() -> commandIndex(harness.executedCommands, "/var/lib/user-data.sh") >= 0, Duration.ofSeconds(2));
+        assertEquals(-1, commandIndex(harness.executedCommands, "/usr/local/sbin/sshd"));
     }
 
     @Test
@@ -960,6 +1521,10 @@ class Ec2ContainerManagerTest {
     }
 
     private static LaunchHarness launchHarness() {
+        return launchHarness(null, Duration.ofMinutes(30));
+    }
+
+    private static LaunchHarness launchHarness(ExecutorService executor, Duration userDataTimeout) {
         ContainerBuilder containerBuilder = mock(ContainerBuilder.class);
         ContainerBuilder.Builder builder = mock(ContainerBuilder.Builder.class, withSettings().defaultAnswer(RETURNS_SELF));
         when(containerBuilder.newContainer(anyString())).thenReturn(builder);
@@ -971,6 +1536,8 @@ class Ec2ContainerManagerTest {
 
         DockerHostResolver dockerHostResolver = mock(DockerHostResolver.class);
         when(dockerHostResolver.resolve()).thenReturn("floci");
+        ContainerReachableEndpoint reachableEndpoint = mock(ContainerReachableEndpoint.class);
+        when(reachableEndpoint.baseUrl()).thenReturn("http://localhost.floci.io:4680");
         PortAllocator portAllocator = mock(PortAllocator.class);
         when(portAllocator.allocate(anyInt(), anyInt())).thenReturn(2201);
 
@@ -982,29 +1549,51 @@ class Ec2ContainerManagerTest {
         when(ec2.sshPortRangeStart()).thenReturn(2200);
         when(ec2.sshPortRangeEnd()).thenReturn(2299);
         when(ec2.imdsPort()).thenReturn(9169);
+        when(ec2.instanceResourceLimits()).thenReturn(true);
 
         DockerClient dockerClient = mock(DockerClient.class);
         stubDockerPing(dockerClient, true);
         Ec2MetadataServer metadataServer = mock(Ec2MetadataServer.class);
         ContainerLogStreamer logStreamer = mock(ContainerLogStreamer.class);
         Ec2PortForwardManager portForwardManager = mock(Ec2PortForwardManager.class);
+        VpcNetworkManager vpcNetworkManager = mock(VpcNetworkManager.class);
         RegionResolver regionResolver = mock(RegionResolver.class);
         when(regionResolver.getAccountId()).thenReturn("000000000000");
-        Ec2ContainerManager manager = new Ec2ContainerManager(
-                containerBuilder,
-                lifecycleManager,
-                logStreamer,
-                mock(ContainerDetector.class),
-                dockerHostResolver,
-                dockerClient,
-                portAllocator,
-                config,
-                metadataServer,
-                portForwardManager,
-                regionResolver,
-                mock(ContainerNetworkReachability.class));
+        Ec2ContainerManager manager = executor == null
+                ? new Ec2ContainerManager(
+                        containerBuilder,
+                        lifecycleManager,
+                        logStreamer,
+                        mock(ContainerDetector.class),
+                        dockerHostResolver,
+                        dockerClient,
+                        portAllocator,
+                        config,
+                        metadataServer,
+                        portForwardManager,
+                        regionResolver,
+                        mock(ContainerNetworkReachability.class),
+                        vpcNetworkManager,
+                        reachableEndpoint)
+                : new Ec2ContainerManager(
+                        containerBuilder,
+                        lifecycleManager,
+                        logStreamer,
+                        mock(ContainerDetector.class),
+                        dockerHostResolver,
+                        dockerClient,
+                        portAllocator,
+                        config,
+                        metadataServer,
+                        portForwardManager,
+                        regionResolver,
+                        mock(ContainerNetworkReachability.class),
+                        vpcNetworkManager,
+                        reachableEndpoint,
+                        executor,
+                        userDataTimeout);
         return new LaunchHarness(manager, lifecycleManager, dockerClient, metadataServer, logStreamer, builder,
-                portAllocator, portForwardManager, config, new CopyOnWriteArrayList<>());
+                portAllocator, portForwardManager, config, vpcNetworkManager, new CopyOnWriteArrayList<>());
     }
 
     // ── startup reconciliation of EC2 containers orphaned by a previous run ──────
@@ -1137,6 +1726,56 @@ class Ec2ContainerManagerTest {
         return harness;
     }
 
+    private static void stubUserDataCallback(LaunchHarness harness, Closeable stream,
+                                             CountDownLatch userDataStarted) throws Exception {
+        AtomicReference<String[]> currentCommand = new AtomicReference<>();
+        ExecCreateCmd execCreate = mock(ExecCreateCmd.class, withSettings().defaultAnswer(RETURNS_SELF));
+        ExecCreateCmdResponse metadataExec = mock(ExecCreateCmdResponse.class);
+        ExecCreateCmdResponse userDataExec = mock(ExecCreateCmdResponse.class);
+        when(metadataExec.getId()).thenReturn("metadata-exec");
+        when(userDataExec.getId()).thenReturn("userdata-exec");
+        when(harness.dockerClient().execCreateCmd(TEST_CONTAINER_ID)).thenReturn(execCreate);
+        when(execCreate.withCmd(any(String[].class))).thenAnswer(invocation -> {
+            Object[] args = invocation.getArguments();
+            currentCommand.set(args.length == 1 && args[0] instanceof String[] command
+                    ? command : Arrays.copyOf(args, args.length, String[].class));
+            return execCreate;
+        });
+        when(execCreate.exec()).thenAnswer(invocation -> {
+            String[] command = currentCommand.get();
+            return command != null && command.length == 1 && "/var/lib/user-data.sh".equals(command[0])
+                    ? userDataExec : metadataExec;
+        });
+
+        when(harness.dockerClient().execStartCmd(anyString())).thenAnswer(invocation -> {
+            String execId = invocation.getArgument(0);
+            ExecStartCmd execStart = mock(ExecStartCmd.class);
+            when(execStart.exec(any())).thenAnswer(startInvocation -> {
+                @SuppressWarnings("unchecked")
+                ResultCallback<Frame> callback = startInvocation.getArgument(0);
+                if ("userdata-exec".equals(execId)) {
+                    callback.onStart(stream);
+                    userDataStarted.countDown();
+                } else {
+                    callback.onComplete();
+                }
+                return callback;
+            });
+            return execStart;
+        });
+
+        InspectExecCmd inspectExec = mock(InspectExecCmd.class);
+        InspectExecResponse inspectExecResponse = mock(InspectExecResponse.class);
+        when(inspectExecResponse.getExitCodeLong()).thenReturn(0L);
+        when(inspectExec.exec()).thenReturn(inspectExecResponse);
+        when(harness.dockerClient().inspectExecCmd(anyString())).thenReturn(inspectExec);
+
+        CopyArchiveToContainerCmd copy = mock(CopyArchiveToContainerCmd.class, withSettings().defaultAnswer(RETURNS_SELF));
+        when(harness.dockerClient().copyArchiveToContainerCmd(TEST_CONTAINER_ID)).thenReturn(copy);
+        when(copy.withTarInputStream(any(InputStream.class))).thenReturn(copy);
+        when(harness.logStreamer().generateLogStreamName(anyString())).thenReturn(TEST_LOG_STREAM_NAME);
+    }
+
     /**
      * Index of the first exec matching {@code expected} exactly, or -1 when it was never run.
      */
@@ -1209,6 +1848,41 @@ class Ec2ContainerManagerTest {
     }
 
     @Test
+    void theTeardownHookRunsOnceTheContainerIsGone() throws Exception {
+        // The hook exists so callers can do work that is only valid after the container has
+        // released its Docker resources, so it must actually fire on the ordinary path.
+        LaunchHarness harness = launchHarness();
+        stubDockerPing(harness.dockerClient(), false);
+        Instance instance = instance("i-teardown-hook");
+        harness.manager().launch(instance, "ubuntu:24.04", null, "us-west-2");
+        AtomicBoolean ran = new AtomicBoolean(false);
+
+        harness.manager().terminate(instance, () -> ran.set(true));
+
+        awaitUntil(ran::get, Duration.ofSeconds(2));
+    }
+
+    @Test
+    void theTeardownHookIsSkippedWhenTheContainerCouldNotBeRemoved() throws Exception {
+        // Running it anyway would start work that depends on the container being gone while it
+        // demonstrably is not, and nothing retries behind it. Skipping and logging is the
+        // honest outcome.
+        LaunchHarness harness = launchHarness();
+        stubDockerPing(harness.dockerClient(), false);
+        Instance instance = instance("i-teardown-hook-refused");
+        harness.manager().launch(instance, "ubuntu:24.04", null, "us-west-2");
+        instance.setDockerContainerId("c-stuck");
+        when(harness.dockerClient().removeContainerCmd("c-stuck"))
+                .thenThrow(new RuntimeException("daemon refused"));
+        AtomicBoolean ran = new AtomicBoolean(false);
+
+        harness.manager().terminate(instance, () -> ran.set(true));
+
+        awaitUntil(() -> "terminated".equals(instance.getState().getName()), Duration.ofSeconds(2));
+        assertFalse(ran.get(), "the hook must not run when the container is still present");
+    }
+
+    @Test
     void metadataOnlyInstanceStopsStartsAndTerminatesWithoutAContainer() throws Exception {
         LaunchHarness harness = launchHarness();
         stubDockerPing(harness.dockerClient(), false);
@@ -1225,6 +1899,183 @@ class Ec2ContainerManagerTest {
 
         harness.manager().terminate(instance);
         awaitUntil(() -> "terminated".equals(instance.getState().getName()), Duration.ofSeconds(2));
+    }
+
+    @Test
+    void launchKnownInstanceTypeAppliesResourceLimitsFromCatalog() throws Exception {
+        Ec2ContainerManager.containerBridgeIpAttempts = 1;
+        Ec2ContainerManager.containerBridgeIpPollMillis = 1;
+        LaunchHarness harness = launchHarness();
+        InspectContainerCmd inspect = mock(InspectContainerCmd.class);
+        when(harness.dockerClient.inspectContainerCmd(TEST_CONTAINER_ID)).thenReturn(inspect);
+        InspectContainerResponse inspectResponse = inspectResponse("172.18.0.12");
+        when(inspect.exec()).thenReturn(inspectResponse);
+        harness.stubSuccessfulExecs(new CountDownLatch(0), new CountDownLatch(0));
+
+        Instance instance = instance("i-limits-known");
+        instance.setInstanceType("t3.micro");
+
+        harness.manager.launch(instance, "ubuntu:24.04", null, "us-west-2");
+        awaitUntil(() -> "running".equals(instance.getState().getName()), Duration.ofSeconds(2));
+
+        verify(harness.builder).withMemoryMb(1024);
+        verify(harness.builder).withCpuUnits(2048);
+    }
+
+    @Test
+    void launchDifferentInstanceTypesProduceDifferentLimits() throws Exception {
+        Ec2ContainerManager.containerBridgeIpAttempts = 1;
+        Ec2ContainerManager.containerBridgeIpPollMillis = 1;
+        LaunchHarness harness = launchHarness();
+        InspectContainerCmd inspect = mock(InspectContainerCmd.class);
+        when(harness.dockerClient.inspectContainerCmd(anyString())).thenReturn(inspect);
+        InspectContainerResponse inspectResponse = inspectResponse("172.18.0.12");
+        when(inspect.exec()).thenReturn(inspectResponse);
+        harness.stubSuccessfulExecs(new CountDownLatch(0), new CountDownLatch(0));
+
+        Instance inst1 = instance("i-t2-micro");
+        inst1.setInstanceType("t2.micro");
+        harness.manager.launch(inst1, "ubuntu:24.04", null, "us-west-2");
+        awaitUntil(() -> "running".equals(inst1.getState().getName()), Duration.ofSeconds(2));
+
+        verify(harness.builder).withMemoryMb(1024);
+        verify(harness.builder).withCpuUnits(1024);
+
+        Instance inst2 = instance("i-t3-small");
+        inst2.setInstanceType("t3.small");
+        harness.manager.launch(inst2, "ubuntu:24.04", null, "us-west-2");
+        awaitUntil(() -> "running".equals(inst2.getState().getName()), Duration.ofSeconds(2));
+
+        verify(harness.builder).withMemoryMb(2048);
+        verify(harness.builder).withCpuUnits(2048);
+    }
+
+    @Test
+    void launchUnknownInstanceTypeLaunchesUnboundedWithoutLimits() throws Exception {
+        Ec2ContainerManager.containerBridgeIpAttempts = 1;
+        Ec2ContainerManager.containerBridgeIpPollMillis = 1;
+        LaunchHarness harness = launchHarness();
+        InspectContainerCmd inspect = mock(InspectContainerCmd.class);
+        when(harness.dockerClient.inspectContainerCmd(TEST_CONTAINER_ID)).thenReturn(inspect);
+        InspectContainerResponse inspectResponse = inspectResponse("172.18.0.12");
+        when(inspect.exec()).thenReturn(inspectResponse);
+        harness.stubSuccessfulExecs(new CountDownLatch(0), new CountDownLatch(0));
+
+        Instance instance = instance("i-unknown-type");
+        instance.setInstanceType("custom.unknown.type");
+
+        harness.manager.launch(instance, "ubuntu:24.04", null, "us-west-2");
+        awaitUntil(() -> "running".equals(instance.getState().getName()), Duration.ofSeconds(2));
+
+        assertEquals("running", instance.getState().getName());
+        verify(harness.builder, never()).withMemoryMb(anyInt());
+        verify(harness.builder, never()).withCpuUnits(anyInt());
+    }
+
+    @Test
+    void launchWithResourceLimitsDisabledProducesNoLimits() throws Exception {
+        Ec2ContainerManager.containerBridgeIpAttempts = 1;
+        Ec2ContainerManager.containerBridgeIpPollMillis = 1;
+        LaunchHarness harness = launchHarness();
+        when(harness.config.services().ec2().instanceResourceLimits()).thenReturn(false);
+
+        InspectContainerCmd inspect = mock(InspectContainerCmd.class);
+        when(harness.dockerClient.inspectContainerCmd(TEST_CONTAINER_ID)).thenReturn(inspect);
+        InspectContainerResponse inspectResponse = inspectResponse("172.18.0.12");
+        when(inspect.exec()).thenReturn(inspectResponse);
+        harness.stubSuccessfulExecs(new CountDownLatch(0), new CountDownLatch(0));
+
+        Instance instance = instance("i-disabled-limits");
+        instance.setInstanceType("t3.micro");
+
+        harness.manager.launch(instance, "ubuntu:24.04", null, "us-west-2");
+        awaitUntil(() -> "running".equals(instance.getState().getName()), Duration.ofSeconds(2));
+
+        assertEquals("running", instance.getState().getName());
+        verify(harness.builder, never()).withMemoryMb(anyInt());
+        verify(harness.builder, never()).withCpuUnits(anyInt());
+    }
+
+    @Test
+    void launchProducesContainerSpecWithCatalogMemoryAndCpuLimits() throws Exception {
+        Ec2ContainerManager.containerBridgeIpAttempts = 1;
+        Ec2ContainerManager.containerBridgeIpPollMillis = 1;
+
+        DockerHostResolver dockerHostResolver = mock(DockerHostResolver.class);
+        when(dockerHostResolver.resolve()).thenReturn("floci");
+        ContainerReachableEndpoint reachableEndpoint = mock(ContainerReachableEndpoint.class);
+        when(reachableEndpoint.baseUrl()).thenReturn("http://localhost.floci.io:4680");
+        PortAllocator portAllocator = mock(PortAllocator.class);
+        when(portAllocator.allocate(anyInt(), anyInt())).thenReturn(2201);
+
+        EmulatorConfig config = mock(EmulatorConfig.class);
+        EmulatorConfig.ServicesConfig services = mock(EmulatorConfig.ServicesConfig.class);
+        EmulatorConfig.Ec2ServiceConfig ec2 = mock(EmulatorConfig.Ec2ServiceConfig.class);
+        when(config.services()).thenReturn(services);
+        when(services.ec2()).thenReturn(ec2);
+        when(services.dockerNetwork()).thenReturn(Optional.empty());
+        when(ec2.sshPortRangeStart()).thenReturn(2200);
+        when(ec2.sshPortRangeEnd()).thenReturn(2299);
+        when(ec2.imdsPort()).thenReturn(9169);
+        when(ec2.instanceResourceLimits()).thenReturn(true);
+
+        EmulatorConfig.DockerConfig docker = mock(EmulatorConfig.DockerConfig.class);
+        when(docker.logMaxSize()).thenReturn("10m");
+        when(docker.logMaxFile()).thenReturn("3");
+        when(docker.extraLabels()).thenReturn(List.of());
+        when(docker.resourceNamespace()).thenReturn(Optional.empty());
+        when(docker.imageRegistryBase()).thenReturn(Optional.empty());
+        when(config.docker()).thenReturn(docker);
+
+        ContainerBuilder realBuilder = new ContainerBuilder(
+                config,
+                dockerHostResolver,
+                mock(EmbeddedDnsServer.class));
+        ContainerLifecycleManager lifecycleManager = mock(ContainerLifecycleManager.class);
+        ArgumentCaptor<ContainerSpec> specCaptor = ArgumentCaptor.forClass(ContainerSpec.class);
+        when(lifecycleManager.create(specCaptor.capture())).thenReturn(TEST_CONTAINER_ID);
+        when(lifecycleManager.isContainerRunning(TEST_CONTAINER_ID)).thenReturn(true);
+
+        DockerClient dockerClient = mock(DockerClient.class);
+        stubDockerPing(dockerClient, true);
+        Ec2MetadataServer metadataServer = mock(Ec2MetadataServer.class);
+        ContainerLogStreamer logStreamer = mock(ContainerLogStreamer.class);
+        Ec2PortForwardManager portForwardManager = mock(Ec2PortForwardManager.class);
+        VpcNetworkManager vpcNetworkManager = mock(VpcNetworkManager.class);
+        RegionResolver regionResolver = mock(RegionResolver.class);
+        when(regionResolver.getAccountId()).thenReturn("000000000000");
+
+        Ec2ContainerManager manager = new Ec2ContainerManager(
+                realBuilder,
+                lifecycleManager,
+                logStreamer,
+                mock(ContainerDetector.class),
+                dockerHostResolver,
+                dockerClient,
+                portAllocator,
+                config,
+                metadataServer,
+                portForwardManager,
+                regionResolver,
+                mock(ContainerNetworkReachability.class),
+                vpcNetworkManager,
+                reachableEndpoint,
+                new Ec2InstanceTypeCatalog());
+
+        InspectContainerCmd inspect = mock(InspectContainerCmd.class);
+        when(dockerClient.inspectContainerCmd(TEST_CONTAINER_ID)).thenReturn(inspect);
+        InspectContainerResponse inspectResponse = inspectResponse("172.18.0.12");
+        when(inspect.exec()).thenReturn(inspectResponse);
+
+        Instance instance = instance("i-spec-limits");
+        instance.setInstanceType("t3.micro");
+
+        manager.launch(instance, "ubuntu:24.04", null, "us-west-2");
+        awaitUntil(() -> "running".equals(instance.getState().getName()), Duration.ofSeconds(2));
+
+        ContainerSpec capturedSpec = specCaptor.getValue();
+        assertEquals(1024L * 1024 * 1024, capturedSpec.memoryBytes());
+        assertEquals(2_000_000_000L, capturedSpec.nanoCpus());
     }
 
     /** Stubs the daemon reachability probe every launch makes before touching Docker. */
@@ -1245,6 +2096,7 @@ class Ec2ContainerManagerTest {
                                  PortAllocator portAllocator,
                                  Ec2PortForwardManager portForwardManager,
                                  EmulatorConfig config,
+                                 VpcNetworkManager vpcNetworkManager,
                                  List<String[]> executedCommands) {
         void stubSuccessfulExecs(CountDownLatch userDataStarted, CountDownLatch finishUserData) throws Exception {
             AtomicReference<String[]> currentCommand = new AtomicReference<>();
@@ -1266,7 +2118,7 @@ class Ec2ContainerManagerTest {
             });
             when(execCreate.exec()).thenAnswer(invocation -> {
                 String[] command = currentCommand.get();
-                if (command != null && command.length == 1 && "/tmp/user-data.sh".equals(command[0])) {
+                if (command != null && command.length == 1 && "/var/lib/user-data.sh".equals(command[0])) {
                     return userDataExec;
                 }
                 return metadataExec;
